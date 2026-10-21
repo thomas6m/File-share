@@ -8,3 +8,6 @@ python3 -m venv venv
 source venv/bin/activate
 python3 -m pip install --upgrade pip
 pip3 install --no-cache-dir -r requirements.txt
+
+
+nohup /data/fileshare/venv/bin/gunicorn -w 2 --timeout 600 -b 0.0.0.0:8080 app:app  > logs.txt 2>&1 &
