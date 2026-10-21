@@ -1,14 +1,16 @@
 # FileShare
 
 A small web app for moving files between a desktop and a Unix server through a browser.
-Files can be **uploaded and downloaded only**. There is no delete, rename or overwrite.
+Files and folders can be **added and downloaded only**. There is no delete, rename or overwrite.
 
 Built with Python and Flask, and designed to run on CentOS as a systemd service.
 
 ## Features
 
 - Browser UI with drag-and-drop upload, upload queue and live progress (percentage and speed)
-- Download list with search and sorting by name, size or modified date
+- Folders and subfolders, browsed like a repository: breadcrumb path, folders listed first, upload into the folder you are viewing
+- **New folder** button to create folders (up to `MAX_FOLDER_DEPTH` levels deep)
+- Download list with filter and sorting by name, size or modified date
 - No delete, no rename, no overwrite. A duplicate filename is saved with a timestamp added
 - Optional protection for downloads (browser login prompt) and for uploads (password field)
 - Password stored encrypted (Fernet) in a `.secrets` folder, never in plain text
@@ -24,7 +26,10 @@ Built with Python and Flask, and designed to run on CentOS as a systemd service.
 ├── requirements.txt     # flask, cryptography, gunicorn
 ├── venv/                # Python virtual environment
 ├── .secrets/            # .fernet.key and .password.enc (created by the encryption script)
-└── fileshare/           # uploaded files live here (created automatically)
+└── fileshare/           # uploaded files and folders live here (created automatically)
+    ├── reports/         # folders created from the UI
+    │   └── 2026_q4/
+    └── notes.txt
 ```
 
 By default both `fileshare/` and `.secrets/` are looked up in the **current working directory**.
@@ -135,6 +140,18 @@ sudo firewall-cmd --reload
 
 Then browse to `http://<server-ip>:8080`.
 
+## Using folders
+
+- Click a folder to open it. The breadcrumb at the top of the list (`Home / reports / 2026_q4`) takes you back up.
+- **Upload files** always saves into the folder you are viewing. The panel shows the destination.
+- **New folder** creates a folder inside the current one. It asks for the upload password when
+  `PROTECT_UPLOAD` is on.
+- Folder and file names are sanitised: spaces become underscores, and characters other than letters,
+  numbers, `-`, `_` and `.` are removed. Names can't start with a dot.
+- Folders can't be renamed or deleted from the app. If a folder name already exists, creation is refused.
+  If a file name already exists in a folder, the new file is saved with a timestamp added.
+- Direct links work: `/tree/<folder path>` opens a folder and `/download/<file path>` downloads a file.
+
 ## Configuration
 
 Edit the CONFIG block at the top of `app.py`. Environment variables (for example in the systemd unit
@@ -151,6 +168,8 @@ with `Environment=`) override the script values where listed.
 | `PROTECT_UPLOAD` | `True` | `PROTECT_UPLOAD` | Password field on the upload form |
 | `AUTH_USER` | `fileshare` | `SHARE_USER` | Username for the download login prompt |
 | `APP_TITLE` | `File share` | none | Name shown in the header and browser tab |
+| `PAGE_MAX_WIDTH` | `100%` | none | Page width cap. `100%` fills the window; use e.g. `1400px` or `90vw` to limit it |
+| `MAX_FOLDER_DEPTH` | `8` | none | How many folder levels deep users can create |
 | `MAX_FAILED` | `5` | none | Wrong upload passwords allowed per IP before lockout |
 | `LOCKOUT_SEC` | `300` | none | Lockout window in seconds |
 | `SHOW_HIDDEN` | `False` | none | List files that start with `.` |
@@ -200,8 +219,14 @@ instead of starting unprotected.
   lsattr -d /opt/fileshare/fileshare
   ```
 
+  This protects the top-level folder only. Folders created later from the UI are not append-only
+  automatically. To cover existing subfolders run `sudo chattr -R +a /opt/fileshare/fileshare`, and repeat
+  it from time to time (for example from cron) for newly created ones.
+
 - **Lockout is per worker.** With `-w 2` the effective limit is slightly looser than `MAX_FAILED`.
-- Only files in the top level of `fileshare/` are served. Subfolders, hidden files and `app.py` are not.
+- Only items inside `fileshare/` are served. Paths are validated segment by segment (no `..`, no hidden names),
+  and symbolic links are ignored, so a link inside `fileshare/` can't expose files elsewhere on the server.
+- New folders are created with mode `750`.
 
 ## Updating
 
@@ -223,6 +248,8 @@ sudo systemctl restart fileshare
 | Permission denied when saving | Check that `fileshare` owns `/opt/fileshare/fileshare`. With SELinux enforcing, run `sudo ausearch -m avc -ts recent`. |
 | Can't reach the page | Check `systemctl status fileshare`, the firewall rule and that the port matches. |
 | Uploads fail after `chattr +a` | Appending is allowed but renaming is not. Check that `lsattr -d` shows `a` only on the uploads folder. |
+| Folder creation fails with "Could not create the folder" | The `fileshare` user needs write access to the parent folder. Check ownership and mode. |
+| Flash messages ("Uploaded: ...") don't always appear | Set a fixed `SECRET_KEY` environment variable. By default the app derives a stable one from the key file. |
 
 SELinux fix if writes are denied:
 
