@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """
-Simple file share: upload + download only (no delete, no overwrite, no rename).
+Simple file share with folders: upload, download and create folders only
+(no delete, no overwrite, no rename).
 """
 import os
 import sys
 import hmac
 import time
+import hashlib
 from pathlib import Path
 from datetime import datetime
 from flask import (Flask, request, redirect, url_for, flash,
@@ -32,6 +34,8 @@ PROTECT_UPLOAD   = True            # True  = upload form asks for the password o
                                    # (both False = fully open; both use the password in SECRETS_DIR)
 AUTH_USER     = "fileshare"        # username for the download login prompt
 APP_TITLE     = "File share"       # name shown in the page header and browser tab
+PAGE_MAX_WIDTH = "100%"            # page width cap: "100%" = fill the window, or e.g. "1400px" / "90vw"
+MAX_FOLDER_DEPTH = 8              # how many folder levels deep users can create
 MAX_FAILED    = 5                  # wrong upload passwords allowed per client IP ...
 LOCKOUT_SEC   = 300                # ... within this many seconds, then uploads are blocked
 SHOW_HIDDEN   = False              # list files starting with "." ?
@@ -81,7 +85,21 @@ os.makedirs(SHARE_DIR, exist_ok=True)
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = MAX_MB * 1024 * 1024
-app.secret_key = os.environ.get("SECRET_KEY", os.urandom(24))
+
+
+def _session_secret():
+    """Stable across gunicorn workers and restarts (flash messages are signed with it)."""
+    env = os.environ.get("SECRET_KEY")
+    if env:
+        return env
+    try:
+        seed = KEY_FILE.read_bytes()
+    except OSError:
+        seed = SHARE_DIR.encode()
+    return hashlib.sha256(b"fileshare-session:" + seed).hexdigest()
+
+
+app.secret_key = _session_secret()
 
 
 # ---------- optional basic auth ----------
@@ -123,9 +141,9 @@ def human(n):
     return f"{n:.1f} PB"
 
 
-def unique_path(name):
+def unique_path(directory, name):
     """Never overwrite an existing file; add a timestamp suffix instead."""
-    path = os.path.join(SHARE_DIR, name)
+    path = os.path.join(directory, name)
     if not os.path.exists(path):
         return path
     base, ext = os.path.splitext(name)
@@ -133,7 +151,7 @@ def unique_path(name):
     n = 0
     while True:
         suffix = f"_{stamp}" + (f"_{n}" if n else "")
-        path = os.path.join(SHARE_DIR, f"{base}{suffix}{ext}")
+        path = os.path.join(directory, f"{base}{suffix}{ext}")
         if not os.path.exists(path):
             return path
         n += 1
@@ -157,20 +175,105 @@ def file_kind(name):
     return "other", (ext.upper()[:4] if ext else "FILE")
 
 
-def list_files():
-    out = []
-    for e in os.scandir(SHARE_DIR):
-        if e.is_file() and e.name != SELF_NAME and (SHOW_HIDDEN or not e.name.startswith(".")):
-            st = e.stat()
+def clean_rel(rel):
+    """Validate a user-supplied relative path (folder or file). 404 on anything odd."""
+    rel = (rel or "").strip("/")
+    if not rel:
+        return ""
+    parts = rel.split("/")
+    for seg in parts:
+        if (not seg or seg in (".", "..") or "\\" in seg or "\x00" in seg
+                or (seg.startswith(".") and not SHOW_HIDDEN)):
+            abort(404)
+    return "/".join(parts)
+
+
+def resolve_dir(rel):
+    """Return (clean relative path, absolute path) of an existing folder inside SHARE_DIR."""
+    rel = clean_rel(rel)
+    root = os.path.realpath(SHARE_DIR)
+    full = os.path.realpath(os.path.join(root, rel))
+    if full != root and not full.startswith(root + os.sep):
+        abort(404)
+    if not os.path.isdir(full):
+        abort(404)
+    return rel, full
+
+
+def dir_stats(path, limit=20000):
+    """(direct item count, total bytes of all files inside, truncated?) for a folder.
+    Symlinks and hidden entries are skipped; counting stops after `limit` entries."""
+    items = size = seen = 0
+    stack, top = [path], True
+    while stack:
+        cur = stack.pop()
+        try:
+            it = list(os.scandir(cur))
+        except OSError:
+            continue
+        for e in it:
+            if (e.name.startswith(".") and not SHOW_HIDDEN) or e.is_symlink():
+                continue
+            if top:
+                items += 1
+            seen += 1
+            if seen > limit:
+                return items, size, True
+            try:
+                if e.is_dir(follow_symlinks=False):
+                    stack.append(e.path)
+                elif e.is_file(follow_symlinks=False):
+                    size += e.stat(follow_symlinks=False).st_size
+            except OSError:
+                pass
+        top = False
+    return items, size, False
+
+
+def list_dir(full, rel):
+    """Folders first (A-Z), then files (newest first). Symlinks and hidden entries are skipped."""
+    dirs, files = [], []
+    for e in os.scandir(full):
+        if (e.name.startswith(".") and not SHOW_HIDDEN) or e.is_symlink():
+            continue
+        child = f"{rel}/{e.name}" if rel else e.name
+        try:
+            st = e.stat(follow_symlinks=False)
+        except OSError:
+            continue
+        mtime = datetime.fromtimestamp(st.st_mtime).strftime("%Y-%m-%d %H:%M:%S")
+        if e.is_dir(follow_symlinks=False):
+            n_items, dsize, partial = dir_stats(e.path)
+            dirs.append({"name": e.name, "rel": child, "is_dir": True, "n_items": n_items,
+                         "bytes": dsize, "size": ("\u2265 " if partial else "") + human(dsize),
+                         "kind": "folder", "ext": "", "mtime": mtime, "ts": st.st_mtime})
+        elif e.is_file(follow_symlinks=False):
+            if not rel and e.name == SELF_NAME:
+                continue
             kind, ext = file_kind(e.name)
-            out.append({"name": e.name, "size": human(st.st_size), "bytes": st.st_size,
-                        "kind": kind, "ext": ext,
-                        "mtime": datetime.fromtimestamp(st.st_mtime).strftime("%Y-%m-%d %H:%M:%S"),
-                        "ts": st.st_mtime})
-    return sorted(out, key=lambda x: x["ts"], reverse=True)
+            files.append({"name": e.name, "rel": child, "is_dir": False, "n_items": 0,
+                          "bytes": st.st_size, "size": human(st.st_size),
+                          "kind": kind, "ext": ext, "mtime": mtime, "ts": st.st_mtime})
+    dirs.sort(key=lambda x: x["name"].lower())
+    files.sort(key=lambda x: x["ts"], reverse=True)
+    return dirs + files
 
 
-# ---------- routes (GET list, POST upload, GET download; nothing else) ----------
+def check_password():
+    """Return an error response if the upload password is required and wrong, else None."""
+    if not PROTECT_UPLOAD:
+        return None
+    ip = client_ip()
+    if locked_out(ip):
+        return "Too many wrong passwords. Try again later.", 429
+    if not password_ok(request.form.get("password", "")):
+        _fails.setdefault(ip, []).append(time.time())
+        return "Wrong upload password.", 403
+    _fails.pop(ip, None)
+    return None
+
+
+# ---------- routes: browse, download, upload, mkdir (there is no delete or rename route) ----------
 PAGE = r"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -182,6 +285,7 @@ PAGE = r"""<!doctype html>
     --acc:#0B6E69; --acc-ink:#FFFFFF; --acc-soft:#DCEEEB;
     --bad:#A32A24; --bad-bg:#FBEDEC; --ok:#0B6E69; --ok-bg:#E3F2EF;
     --b-l:92%; --b-c:30%; --b-s:60%;
+    --maxw:{{ max_w }};
   }
   @media (prefers-color-scheme:dark){
     :root{
@@ -195,7 +299,7 @@ PAGE = r"""<!doctype html>
   html{-webkit-text-size-adjust:100%}
   body{margin:0;background:var(--bg);color:var(--ink);
        font:15px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif}
-  .wrap{max-width:1080px;margin:0 auto;padding:0 20px}
+  .wrap{max-width:var(--maxw);margin:0 auto;padding:0 clamp(16px,2.5vw,40px)}
   :focus-visible{outline:2px solid var(--acc);outline-offset:2px}
   button,input{font:inherit;color:inherit}
   .num{font-variant-numeric:tabular-nums}
@@ -213,7 +317,7 @@ PAGE = r"""<!doctype html>
   .lock svg{width:14px;height:14px;stroke:currentColor}
 
   /* layout */
-  .grid{display:grid;grid-template-columns:344px minmax(0,1fr);gap:20px;align-items:start;margin:24px auto 48px}
+  .grid{display:grid;grid-template-columns:clamp(320px,26vw,440px) minmax(0,1fr);gap:20px;align-items:start;margin:24px auto 48px}
   @media (max-width:880px){.grid{grid-template-columns:1fr}}
   .panel{background:var(--panel);border:1px solid var(--line);border-radius:10px}
   .upload{position:sticky;top:20px}
@@ -284,6 +388,7 @@ PAGE = r"""<!doctype html>
   th[aria-sort="ascending"] button::after{border-bottom:5px solid currentColor;border-top:0;opacity:1}
   th[aria-sort="descending"] button::after{border-top:5px solid currentColor;border-bottom:0;opacity:1}
   td.r,th.r{text-align:right}
+  td.num{white-space:nowrap}
   tbody tr:hover{background:var(--soft)}
   .file{display:flex;align-items:center;gap:12px;min-width:0}
   .badge{flex:none;width:38px;height:38px;border-radius:8px;display:grid;place-items:center;
@@ -297,6 +402,30 @@ PAGE = r"""<!doctype html>
   .dl:hover{border-color:var(--acc);color:var(--acc)}
   .dl svg{width:15px;height:15px;stroke:currentColor}
   .empty td{padding:44px 18px;text-align:center;color:var(--mut)}
+  .crumbs{font-size:15px;line-height:1.4}
+  .crumbs nav{display:flex;flex-wrap:wrap;align-items:center;gap:2px 8px}
+  .crumbs a{color:var(--acc);text-decoration:none;font-weight:600}
+  .crumbs a:hover{text-decoration:underline;text-underline-offset:3px}
+  .crumbs .sep{color:var(--mut);font-weight:400}
+  .crumbs [aria-current]{font-weight:650;overflow-wrap:anywhere}
+  .badge[data-k="folder"]{background:var(--acc-soft);color:var(--acc)}
+  .badge svg{width:20px;height:20px;stroke:currentColor}
+  a.fname{color:var(--ink);text-decoration:none;font-weight:650}
+  a.fname:hover{color:var(--acc);text-decoration:underline;text-underline-offset:3px}
+  .dest{margin:0 0 12px}
+  .dest strong{color:var(--ink);font-weight:650;overflow-wrap:anywhere}
+  .newf{display:inline-flex;align-items:center;gap:6px;height:36px;padding:0 12px;border:1px solid var(--line);border-radius:8px;
+        background:var(--panel);cursor:pointer;font-weight:550;font-size:13.5px;white-space:nowrap}
+  .newf:hover{border-color:var(--acc);color:var(--acc)}
+  .newf svg{width:15px;height:15px;stroke:currentColor}
+  dialog{width:min(440px,92vw);padding:20px;border:1px solid var(--line);border-radius:12px;background:var(--panel);color:var(--ink)}
+  dialog::backdrop{background:rgba(8,14,20,.55)}
+  dialog h2{font-size:17px}
+  dialog input[type=text],dialog input[type=password]{width:100%;height:40px;padding:0 12px;border:1px solid var(--line);border-radius:8px;background:var(--panel)}
+  dialog input:focus-visible{outline-offset:0}
+  .row{display:flex;gap:10px;margin-top:16px}
+  .row .btn{margin-top:0;flex:1}
+  .btn.ghost{background:var(--soft);color:var(--ink);border:1px solid var(--line)}
   @media (max-width:640px){.hide-sm{display:none}.search input{width:100%}.search{flex:1}}
   @media (prefers-reduced-motion:reduce){*{transition:none!important}}
 </style></head>
@@ -316,6 +445,7 @@ PAGE = r"""<!doctype html>
   <section class="panel upload" aria-labelledby="uh">
     <div class="phead"><h2 id="uh">Upload files</h2><span class="sub">Up to {{ max_mb }} MB per upload</span></div>
     <div class="pbody">
+      <p class="dest sub">Uploading to <strong>{{ dest_label }}</strong></p>
       <button type="button" id="zone" class="zone" aria-describedby="zhint">
         <span class="fill" id="fill"></span>
         <span class="in" id="zin">
@@ -347,11 +477,15 @@ PAGE = r"""<!doctype html>
 
   <section class="panel" aria-labelledby="lh">
     <div class="phead">
-      <div><h2 id="lh">Files</h2><span class="sub num" id="stats">{{ count }} file{{ '' if count == 1 else 's' }} · {{ total }}</span></div>
+      <div>
+        <h2 id="lh" class="crumbs"><nav aria-label="Breadcrumb">{% for c in crumbs %}{% if not loop.last %}<a href="{{ url_for('browse', p=c.rel) }}">{{ c.name }}</a><span class="sep" aria-hidden="true">/</span>{% else %}<span aria-current="page">{{ c.name }}</span>{% endif %}{% endfor %}</nav></h2>
+        <span class="sub num" id="stats">{{ nd }} folder{{ '' if nd == 1 else 's' }} · {{ nf }} file{{ '' if nf == 1 else 's' }} · {{ total }}</span>
+      </div>
       <div class="tools">
+        <button type="button" class="newf" id="newf"><svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>New folder</button>
         <div class="search">
           <svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="M20 20l-3.5-3.5"/></svg>
-          <input id="q" type="search" placeholder="Search by name" aria-label="Search files by name">
+          <input id="q" type="search" placeholder="Filter this folder" aria-label="Filter this folder by name">
         </div>
       </div>
     </div>
@@ -364,25 +498,51 @@ PAGE = r"""<!doctype html>
         <th scope="col" class="r"><span class="sr" style="position:absolute;left:-9999px">Download</span></th>
       </tr></thead>
       <tbody id="rows">
-        {% for f in files %}
-        <tr data-name="{{ f.name|lower }}" data-size="{{ f.bytes }}" data-ts="{{ f.ts }}">
+        {% for f in entries %}
+        <tr data-name="{{ f.name|lower }}" data-dir="{{ 1 if f.is_dir else 0 }}" data-size="{{ f.bytes }}" data-ts="{{ f.ts }}">
+          {% if f.is_dir %}
+          <td><div class="file"><span class="badge" data-k="folder" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg></span><div><a class="fname" href="{{ url_for('browse', p=f.rel) }}">{{ f.name }}</a><div class="sub">{{ f.n_items }} item{{ '' if f.n_items == 1 else 's' }}</div></div></div></td>
+          <td class="r num">{{ f.size }}</td>
+          <td class="hide-sm num">{{ f.mtime }}</td>
+          <td class="r"><a class="dl" href="{{ url_for('browse', p=f.rel) }}" aria-label="Open folder {{ f.name }}">Open</a></td>
+          {% else %}
           <td><div class="file"><span class="badge" data-k="{{ f.kind }}" aria-hidden="true">{{ f.ext }}</span><span class="fname">{{ f.name }}</span></div></td>
           <td class="r num">{{ f.size }}</td>
           <td class="hide-sm num">{{ f.mtime }}</td>
-          <td class="r"><a class="dl" href="{{ url_for('download', filename=f.name) }}" aria-label="Download {{ f.name }}">
+          <td class="r"><a class="dl" href="{{ url_for('download', filepath=f.rel) }}" aria-label="Download {{ f.name }}">
             <svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 4v11M7.5 10.5L12 15l4.5-4.5M5 20h14"/></svg>Download</a></td>
+          {% endif %}
         </tr>
         {% endfor %}
-        <tr class="empty" id="empty" {% if files %}hidden{% endif %}><td colspan="4" id="emptytxt">No files yet. Drop a file into the upload panel to add the first one.</td></tr>
+        <tr class="empty" id="empty" {% if entries %}hidden{% endif %}><td colspan="4" id="emptytxt">{{ 'This folder is empty.' if cur else 'Nothing here yet.' }} Drop files into the upload panel or create a folder.</td></tr>
       </tbody>
     </table></div>
   </section>
 </main>
 
+<dialog id="mk" aria-labelledby="mkh">
+  <form id="mkform" novalidate>
+    <h2 id="mkh">New folder</h2>
+    <p class="sub">It will be created in <strong>{{ dest_label }}</strong>. Folders can’t be renamed or deleted afterwards.</p>
+    <label class="f" for="mkname">Folder name</label>
+    <input id="mkname" type="text" maxlength="100" autocomplete="off" spellcheck="false">
+    <p class="sub" style="margin:6px 0 0">Letters, numbers, dashes, underscores and dots. Spaces become underscores.</p>
+    {% if need_pw %}
+    <label class="f" for="mkpw">Upload password</label>
+    <input id="mkpw" type="password" autocomplete="off" spellcheck="false">
+    {% endif %}
+    <div id="mkerr" class="note err" role="alert" hidden></div>
+    <div class="row">
+      <button type="button" class="btn ghost" id="mkcancel">Cancel</button>
+      <button type="submit" class="btn" id="mkgo">Create folder</button>
+    </div>
+  </form>
+</dialog>
+
 <script>
 (function(){
   var $ = function(id){return document.getElementById(id)};
-  var MAX = {{ max_mb }} * 1048576, NEED_PW = {{ 'true' if need_pw else 'false' }};
+  var CUR = {{ cur|tojson }}, MAX = {{ max_mb }} * 1048576, NEED_PW = {{ 'true' if need_pw else 'false' }};
   var zone=$('zone'), fileIn=$('file'), fill=$('fill'), zin=$('zin'), go=$('go'), err=$('err'),
       qwrap=$('qwrap'), queueEl=$('queue'), qsum=$('qsum'), pw=$('pw'), busy=false, queue=[];
 
@@ -441,7 +601,7 @@ PAGE = r"""<!doctype html>
   go.onclick=function(){
     if(NEED_PW && !pw.value){showErr('Enter the upload password to continue.');pw.focus();return}
     showErr('');
-    var fd=new FormData(); queue.forEach(function(f){fd.append('files',f)});
+    var fd=new FormData(); queue.forEach(function(f){fd.append('files',f)}); fd.append('path',CUR);
     if(NEED_PW) fd.append('password',pw.value);
     var x=new XMLHttpRequest(), t0=Date.now();
     x.open('POST','{{ url_for("upload") }}');
@@ -478,6 +638,7 @@ PAGE = r"""<!doctype html>
     b.onclick=function(){
       var k=b.dataset.key; dir=(key===k)?-dir:(k==='name'?1:-1); key=k;
       rows().sort(function(a,c){
+        if(a.dataset.dir!==c.dataset.dir) return a.dataset.dir==='1'?-1:1;
         var x=a.dataset[k], y=c.dataset[k];
         if(k!=='name'){x=parseFloat(x);y=parseFloat(y);return (x-y)*dir}
         return x.localeCompare(y)*dir;
@@ -487,53 +648,111 @@ PAGE = r"""<!doctype html>
     };
   });
   render();
+
+  /* new folder dialog */
+  var mk=$('mk'), mkname=$('mkname'), mkpw=$('mkpw'), mkerr=$('mkerr'), mkgo=$('mkgo');
+  function mkFail(t){mkerr.textContent=t;mkerr.hidden=false;mkgo.disabled=false}
+  $('newf').onclick=function(){
+    mkerr.hidden=true; mkname.value=''; mkgo.disabled=false;
+    if(mkpw&&pw) mkpw.value=pw.value;
+    mk.showModal(); mkname.focus();
+  };
+  $('mkcancel').onclick=function(){mk.close()};
+  $('mkform').onsubmit=function(ev){
+    ev.preventDefault();
+    var name=mkname.value.trim();
+    if(!name){mkFail('Enter a name for the folder.');mkname.focus();return}
+    if(NEED_PW && !mkpw.value){mkFail('Enter the upload password to continue.');mkpw.focus();return}
+    var fd=new FormData(); fd.append('path',CUR); fd.append('name',name);
+    if(NEED_PW) fd.append('password',mkpw.value);
+    mkerr.hidden=true; mkgo.disabled=true;
+    fetch('{{ url_for("mkdir") }}',{method:'POST',body:fd,credentials:'same-origin'})
+      .then(function(r){return r.text().then(function(t){return {ok:r.ok,t:t}})})
+      .then(function(res){if(res.ok){location.reload()}else{mkFail(res.t||'The folder could not be created.')}})
+      .catch(function(){mkFail('The connection dropped. Check your network and try again.')});
+  };
 })();
 </script>
 </body></html>
 """
 
 
-@app.get("/")
-def index():
-    files = list_files()
+@app.get("/", defaults={"p": ""})
+@app.get("/tree/<path:p>")
+def browse(p):
+    rel, full = resolve_dir(p)
+    entries = list_dir(full, rel)
+    crumbs, acc = [{"name": "Home", "rel": ""}], []
+    for seg in (rel.split("/") if rel else []):
+        acc.append(seg)
+        crumbs.append({"name": seg, "rel": "/".join(acc)})
+    nd = sum(1 for e in entries if e["is_dir"])
+    nf = len(entries) - nd
     return render_template_string(
-        PAGE, files=files, need_pw=PROTECT_UPLOAD, title=APP_TITLE, max_mb=MAX_UPLOAD_MB,
-        count=len(files), total=human(sum(f["bytes"] for f in files)))
+        PAGE, entries=entries, cur=rel, crumbs=crumbs, nd=nd, nf=nf,
+        dest_label=" / ".join(c["name"] for c in crumbs),
+        total=human(sum(e["bytes"] for e in entries)),
+        need_pw=PROTECT_UPLOAD, title=APP_TITLE, max_mb=MAX_UPLOAD_MB, max_w=PAGE_MAX_WIDTH)
 
 
 @app.post("/upload")
 def upload():
-    if PROTECT_UPLOAD:
-        ip = client_ip()
-        if locked_out(ip):
-            return "Too many wrong passwords. Try again later.", 429
-        if not password_ok(request.form.get("password", "")):
-            _fails.setdefault(ip, []).append(time.time())
-            return "Wrong upload password.", 403
-        _fails.pop(ip, None)
+    bad = check_password()
+    if bad:
+        return bad
+    rel, full = resolve_dir(request.form.get("path", ""))
     saved, skipped = [], []
     for f in request.files.getlist("files"):
         name = secure_filename(f.filename or "")
         if not name:
             skipped.append(f.filename or "(empty)")
             continue
-        path = unique_path(name)
+        path = unique_path(full, name)
         f.save(path)
         os.chmod(path, 0o644)
         saved.append(os.path.basename(path))
+    where = f" to {rel}" if rel else ""
     if saved:
-        flash(f"Uploaded: {', '.join(saved)}")
+        flash(f"Uploaded{where}: {', '.join(saved)}")
     if skipped:
         flash(f"Skipped invalid names: {', '.join(skipped)}")
-    return redirect(url_for("index"))
+    return redirect(url_for("browse", p=rel))
 
 
-@app.get("/download/<path:filename>")
-def download(filename):
-    # send_from_directory blocks path traversal; also refuse sub-paths/hidden files
-    if "/" in filename or filename == SELF_NAME or (filename.startswith(".") and not SHOW_HIDDEN):
+@app.post("/mkdir")
+def mkdir():
+    bad = check_password()
+    if bad:
+        return bad
+    rel, full = resolve_dir(request.form.get("path", ""))
+    raw = (request.form.get("name") or "").strip()
+    name = secure_filename(raw)
+    if not name or len(name) > 100:
+        return "Enter a folder name using letters, numbers, dashes, underscores or dots.", 400
+    depth = (rel.count("/") + 1 if rel else 0) + 1
+    if depth > MAX_FOLDER_DEPTH:
+        return f"Folders can be nested up to {MAX_FOLDER_DEPTH} levels deep.", 400
+    try:
+        os.mkdir(os.path.join(full, name), 0o750)
+    except FileExistsError:
+        return f"\u201c{name}\u201d already exists in this folder.", 409
+    except OSError as e:
+        return f"Could not create the folder ({e.strerror}).", 500
+    flash(f"Created folder {name}" + (f" (name adjusted from \u201c{raw}\u201d)" if name != raw else ""))
+    return "", 204
+
+
+@app.get("/download/<path:filepath>")
+def download(filepath):
+    rel = clean_rel(filepath)
+    parent, name = os.path.split(rel)
+    if not name or (not parent and name == SELF_NAME):
         abort(404)
-    return send_from_directory(SHARE_DIR, filename, as_attachment=True)
+    _, full = resolve_dir(parent)
+    target = os.path.join(full, name)
+    if os.path.islink(target) or not os.path.isfile(target):
+        abort(404)
+    return send_from_directory(full, name, as_attachment=True)
 
 
 @app.errorhandler(413)
