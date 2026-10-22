@@ -7,12 +7,19 @@ import os
 import sys
 import hmac
 import time
+import re
+import json
 import hashlib
+import secrets
+import sqlite3
+from contextlib import closing
+from functools import wraps
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta
 from flask import (Flask, request, redirect, url_for, flash,
-                   send_from_directory, render_template_string, Response, abort)
+                   send_from_directory, render_template_string, Response, abort, session)
 from werkzeug.utils import secure_filename
+from werkzeug.security import check_password_hash, generate_password_hash
 from cryptography.fernet import Fernet
 
 # =====================================================================
@@ -33,9 +40,21 @@ PROTECT_UPLOAD   = True            # True  = upload form asks for the password o
                                    # False = anyone who can reach the page can upload
                                    # (both False = fully open; both use the password in SECRETS_DIR)
 AUTH_USER     = "fileshare"        # username for the download login prompt
-APP_TITLE     = "File share"       # name shown in the page header and browser tab
+APP_TITLE     = "FileNest"         # name shown in the page header and browser tab
+APP_TAGLINE   = "Your files. Your pages. One place."   # line under the name in the header
 PAGE_MAX_WIDTH = "100%"            # page width cap: "100%" = fill the window, or e.g. "1400px" / "90vw"
 MAX_FOLDER_DEPTH = 8              # how many folder levels deep users can create
+PAGES_ENABLED = True               # host static HTML pages
+PAGES_LOGIN   = "shared"           # "shared"   = sign in with the same shared password as uploads, plus a display name
+                                   #              (shown as "Uploaded by"; everyone signed in sees every page)
+                                   # "accounts" = personal accounts from manage_users.py, with per-user and per-group
+                                   #              viewing and a trusted "Uploaded by"
+PAGES_DIR     = ""                 # pages and their metadata; "" = <current working dir>/pages
+USERS_FILE    = ""                 # user accounts; "" = <SECRETS_DIR>/users.json
+PAGE_MAX_MB   = 20                 # max size of one HTML page, in MB
+PAGE_SANDBOX  = True               # run hosted pages in an isolated sandbox (recommended; see README)
+SESSION_HOURS = 8                  # how long a page sign-in lasts
+COOKIE_SECURE = False              # set True when the app is served over HTTPS
 MAX_FAILED    = 5                  # wrong upload passwords allowed per client IP ...
 LOCKOUT_SEC   = 300                # ... within this many seconds, then uploads are blocked
 SHOW_HIDDEN   = False              # list files starting with "." ?
@@ -56,6 +75,21 @@ def env_bool(name, default):
 
 PROTECT_DOWNLOAD = env_bool("PROTECT_DOWNLOAD", PROTECT_DOWNLOAD)
 PROTECT_UPLOAD   = env_bool("PROTECT_UPLOAD", PROTECT_UPLOAD)
+PAGES_ENABLED    = env_bool("PAGES_ENABLED", PAGES_ENABLED)
+PAGES_LOGIN      = os.environ.get("PAGES_LOGIN", PAGES_LOGIN).strip().lower()
+if PAGES_LOGIN not in ("shared", "accounts"):
+    sys.exit('[FATAL] PAGES_LOGIN must be "shared" or "accounts".')
+SHARED_MODE      = PAGES_ENABLED and PAGES_LOGIN == "shared"
+PAGE_SANDBOX     = env_bool("PAGE_SANDBOX", PAGE_SANDBOX)
+COOKIE_SECURE    = env_bool("COOKIE_SECURE", COOKIE_SECURE)
+PAGE_MAX_MB      = int(os.environ.get("PAGE_MAX_MB", PAGE_MAX_MB))
+SESSION_HOURS    = float(os.environ.get("SESSION_HOURS", SESSION_HOURS))
+PAGES_DIR        = os.path.abspath(os.environ.get("PAGES_DIR") or PAGES_DIR or os.path.join(os.getcwd(), "pages"))
+USERS_FILE       = Path(os.environ.get("USERS_FILE") or USERS_FILE or SECRETS_DIR / "users.json")
+PAGE_FILES_DIR   = os.path.join(PAGES_DIR, "files")
+PAGES_DB         = os.path.join(PAGES_DIR, "pages.db")
+PAGE_PREFIXES    = ("/pages", "/p/", "/login", "/logout")   # routes that use user accounts, not the shared password
+SESSION_KEY_FILE = SECRETS_DIR / ".session.key"
 MAX_MB        = MAX_UPLOAD_MB
 SELF_NAME     = os.path.basename(os.path.abspath(__file__))  # never listed or served
 
@@ -72,10 +106,11 @@ def load_password():
     except Exception as e:
         sys.exit(f"[FATAL] Cannot load password from {SECRETS_DIR}: "
                  f"{type(e).__name__}: {e}\n"
-                 f"Run the encryption script first, or set PROTECT_DOWNLOAD and PROTECT_UPLOAD to False.")
+                 f"Run the encryption script first. (The password is needed while PROTECT_DOWNLOAD, PROTECT_UPLOAD "
+                 f"or the shared Pages login is on.)")
 
 
-PASSWORD = load_password() if (PROTECT_DOWNLOAD or PROTECT_UPLOAD) else None
+PASSWORD = load_password() if (PROTECT_DOWNLOAD or PROTECT_UPLOAD or SHARED_MODE) else None
 if PROTECT_DOWNLOAD and not USER:
     sys.exit("[FATAL] PROTECT_DOWNLOAD is on but AUTH_USER is empty.")
 print(f"[fileshare] download protected: {PROTECT_DOWNLOAD} | upload protected: {PROTECT_UPLOAD}",
@@ -88,23 +123,54 @@ app.config["MAX_CONTENT_LENGTH"] = MAX_MB * 1024 * 1024
 
 
 def _session_secret():
-    """Stable across gunicorn workers and restarts (flash messages are signed with it)."""
+    """Random key stored in the secrets folder, shared by all gunicorn workers.
+    Sign-in sessions are signed with it, so it must stay private."""
     env = os.environ.get("SECRET_KEY")
     if env:
         return env
     try:
-        seed = KEY_FILE.read_bytes()
+        return SESSION_KEY_FILE.read_text().strip()
     except OSError:
-        seed = SHARE_DIR.encode()
-    return hashlib.sha256(b"fileshare-session:" + seed).hexdigest()
+        pass
+    try:
+        os.makedirs(SECRETS_DIR, mode=0o700, exist_ok=True)
+        tmp = f"{SESSION_KEY_FILE}.{os.getpid()}.tmp"
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w") as fh:
+            fh.write(secrets.token_hex(32))
+        try:
+            os.link(tmp, SESSION_KEY_FILE)      # atomic: only one worker wins
+        except FileExistsError:
+            pass
+        finally:
+            os.unlink(tmp)
+        return SESSION_KEY_FILE.read_text().strip()
+    except OSError as e:
+        if PAGES_ENABLED:
+            sys.exit(f"[FATAL] Cannot create the session key in {SECRETS_DIR}: {e}\n"
+                     f"Fix the folder permissions or set the SECRET_KEY environment variable.")
+        # file-share only: the session just carries flash messages, a derived key is enough
+        return hashlib.sha256(b"fileshare-session:" + SHARE_DIR.encode()).hexdigest()
 
 
 app.secret_key = _session_secret()
+app.config.update(
+    SESSION_COOKIE_NAME="fileshare_session",
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="Lax",
+    SESSION_COOKIE_SECURE=COOKIE_SECURE,
+    PERMANENT_SESSION_LIFETIME=timedelta(hours=SESSION_HOURS),
+)
+app.jinja_env.globals["app_tagline"] = APP_TAGLINE
 
 
 # ---------- optional basic auth ----------
 @app.before_request
 def check_auth():
+    if request.path.startswith(PAGE_PREFIXES):
+        if not PAGES_ENABLED:
+            abort(404)
+        return          # hosted pages use user accounts and their own sign-in page
     if not PROTECT_DOWNLOAD:
         return
     a = request.authorization
@@ -274,12 +340,14 @@ def check_password():
 
 
 # ---------- routes: browse, download, upload, mkdir (there is no delete or rename route) ----------
-PAGE = r"""<!doctype html>
+HEAD = r"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>{{ title }}</title>
-<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%230B6E69'/%3E%3Cpath d='M8 19v4h16v-4M16 9v10M11.5 14.5L16 9l4.5 5.5' fill='none' stroke='white' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
-<style>
+<title>{{ ptitle or title }}</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Crect width='24' height='24' rx='6' fill='%232DD4BF'/%3E%3Cpath d='M5 9.5c1.6-1.4 4-2.2 7-2.2s5.4.8 7 2.2M4 13c1.8-1.5 4.4-2.4 8-2.4s6.2.9 8 2.4M6.5 17c1.4-1.1 3.2-1.7 5.5-1.7s4.1.6 5.5 1.7' fill='none' stroke='%230B2236' stroke-width='1.8' stroke-linecap='round'/%3E%3C/svg%3E">
+<style>"""
+
+CSS_BASE = r"""
   :root{
     --bg:#EDF1F4; --panel:#FFFFFF; --soft:#F5F7F9; --ink:#15212B; --mut:#586979; --line:#D6DDE3;
     --acc:#0B6E69; --acc-ink:#FFFFFF; --acc-soft:#DCEEEB;
@@ -428,18 +496,98 @@ PAGE = r"""<!doctype html>
   .btn.ghost{background:var(--soft);color:var(--ink);border:1px solid var(--line)}
   @media (max-width:640px){.hide-sm{display:none}.search input{width:100%}.search{flex:1}}
   @media (prefers-reduced-motion:reduce){*{transition:none!important}}
-</style></head>
-<body>
-<header class="top"><div class="wrap">
-  <div class="brand">
-    <div class="logo" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 15v4h16v-4M12 5v10M7.5 9.5L12 5l4.5 4.5"/></svg></div>
-    <div><h1>{{ title }}</h1><p>Move files between your desktop and this server</p></div>
+"""
+
+CSS_EXTRA = r"""
+  /* ---- header nav + account ---- */
+  .top .left{display:flex;align-items:center;gap:20px;flex-wrap:wrap}
+  .top .right{display:flex;align-items:center;gap:14px;flex-wrap:wrap}
+  .tabs{display:flex;gap:4px}
+  .tabs a{padding:7px 14px;border-radius:8px;color:var(--mut);text-decoration:none;font-weight:600;font-size:14px}
+  .tabs a:hover{background:var(--soft);color:var(--ink)}
+  .tabs a[aria-current]{background:var(--acc-soft);color:var(--acc)}
+  .who{display:inline-flex;align-items:center;gap:10px;font-size:13px;color:var(--mut);flex-wrap:wrap}
+  .who strong{color:var(--ink)}
+  .who form{margin:0}
+
+  /* ---- forms ---- */
+  .fld{width:100%;height:40px;padding:0 12px;border:1px solid var(--line);border-radius:8px;background:var(--panel);color:var(--ink)}
+  .fld:focus-visible{outline-offset:0}
+  .fld[aria-invalid="true"]{border-color:var(--bad)}
+  input[type=file].fld{height:auto;padding:8px;cursor:pointer}
+  input[type=file]::file-selector-button{margin-right:10px;padding:6px 12px;border:1px solid var(--line);border-radius:6px;background:var(--soft);color:var(--ink);cursor:pointer;font:inherit;font-size:13px}
+  .req{color:var(--bad)}
+  .ferr{margin:6px 0 0;color:var(--bad);font-size:13px}
+  .hint{margin:6px 0 0;font-size:12.5px;color:var(--mut)}
+  .sr{position:absolute;left:-9999px}
+  pre.code{margin:8px 0 0;padding:10px 12px;background:var(--soft);border:1px solid var(--line);border-radius:8px;font:13px ui-monospace,SFMono-Regular,Consolas,monospace;overflow-x:auto}
+  .login{max-width:420px;margin:56px auto}
+
+  /* ---- pages list ---- */
+  .pill{display:inline-block;padding:2px 10px;border-radius:999px;font-size:12px;font-weight:600;white-space:nowrap}
+  .pill.ok{background:var(--ok-bg);color:var(--ok)}
+  .pill.off{background:var(--soft);color:var(--mut);border:1px solid var(--line)}
+  .chips{display:flex;flex-wrap:wrap;gap:8px;padding:14px 18px;border-bottom:1px solid var(--line)}
+  .chip{border:1px solid var(--line);background:var(--panel);border-radius:999px;padding:5px 12px;font-size:13px;cursor:pointer;color:var(--ink)}
+  .chip:hover{border-color:var(--acc)}
+  .chip[aria-pressed="true"]{background:var(--acc);color:var(--acc-ink);border-color:var(--acc)}
+  .chip span{opacity:.7;margin-left:6px}
+  .stored{font-size:12.5px;color:var(--mut);overflow-wrap:anywhere;margin-top:2px}
+  .vw{display:flex;flex-wrap:wrap;gap:4px}
+  .tag{display:inline-block;padding:1px 8px;border-radius:6px;background:var(--soft);border:1px solid var(--line);font-size:12.5px;overflow-wrap:anywhere}
+  .act{display:flex;gap:8px;justify-content:flex-end;align-items:center;flex-wrap:wrap}
+  .act form{margin:0}
+  .mini{height:32px;padding:0 12px;border:1px solid var(--line);border-radius:8px;background:var(--panel);cursor:pointer;font-size:13.5px;font-weight:550;white-space:nowrap}
+  .mini:hover{border-color:var(--acc);color:var(--acc)}
+  td.top-a{vertical-align:top}
+  @media (max-width:1100px){.hide-md{display:none}}
+
+  /* ---- FileNest header: navy bar, teal mark ---- */
+  .top{background:#0F2A43;border-bottom:1px solid #1B4163}
+  .top h1{color:#FFFFFF}
+  .top .brand p{color:#B7C6D8}
+  .top .logo{background:#2DD4BF}
+  .top .logo svg{stroke:#0B2236;stroke-width:1.8}
+  .top .tabs a{color:#B7C6D8}
+  .top .tabs a:hover{background:rgba(255,255,255,.09);color:#FFFFFF}
+  .top .tabs a[aria-current]{background:rgba(45,212,191,.16);color:#5EEAD4}
+  .top .lock{background:rgba(255,255,255,.06);border-color:rgba(255,255,255,.2);color:#B7C6D8}
+  .top .who{color:#B7C6D8}
+  .top .who strong{color:#FFFFFF}
+  .top .who .link{color:#5EEAD4}
+  .top .pill.off{background:rgba(255,255,255,.08);border-color:rgba(255,255,255,.2);color:#B7C6D8}
+  .top :focus-visible{outline-color:#5EEAD4}
+"""
+
+HEADER = r"""<header class="top"><div class="wrap">
+  <div class="left">
+    <div class="brand">
+      <div class="logo" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke-linecap="round" stroke-linejoin="round"><path d="M5 9.5c1.6-1.4 4-2.2 7-2.2s5.4.8 7 2.2M4 13c1.8-1.5 4.4-2.4 8-2.4s6.2.9 8 2.4M6.5 17c1.4-1.1 3.2-1.7 5.5-1.7s4.1.6 5.5 1.7"/></svg></div>
+      <div><h1>{{ title }}</h1><p>{{ app_tagline }}</p></div>
+    </div>
+    {% if pages_on %}
+    <nav class="tabs" aria-label="Sections">
+      <a href="{{ url_for('browse', p='') }}"{% if nav == 'files' %} aria-current="page"{% endif %}>Files</a>
+      <a href="{{ url_for('pages') }}"{% if nav == 'pages' %} aria-current="page"{% endif %}>Pages</a>
+    </nav>
+    {% endif %}
   </div>
-  <div class="lock" title="Files can be added and downloaded. They can't be deleted or overwritten.">
-    <svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/></svg>
-    Read-only: upload and download
+  <div class="right">
+    {% if user %}
+    <div class="who">Signed in as <strong>{{ user.name }}</strong>{% if user.role == 'admin' and not user.shared %}<span class="pill off">admin</span>{% endif %}
+      <form method="post" action="{{ url_for('logout') }}"><input type="hidden" name="csrf" value="{{ csrf }}"><button class="link" type="submit">Sign out</button></form></div>
+    {% endif %}
+    <div class="lock" title="{{ badge_hint or 'Files can be added and downloaded. They can\u2019t be deleted or overwritten.' }}">
+      <svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/></svg>
+      {{ badge or 'Read-only: upload and download' }}
+    </div>
   </div>
 </div></header>
+"""
+
+PAGE_BODY = r"""</style></head>
+<body>
+<!--HEADER-->
 
 <main class="wrap grid">
   <section class="panel upload" aria-labelledby="uh">
@@ -676,6 +824,8 @@ PAGE = r"""<!doctype html>
 </body></html>
 """
 
+PAGE = (HEAD + "/*CSS*/" + PAGE_BODY).replace("/*CSS*/", CSS_BASE + CSS_EXTRA).replace("<!--HEADER-->", HEADER)
+
 
 @app.get("/", defaults={"p": ""})
 @app.get("/tree/<path:p>")
@@ -688,8 +838,10 @@ def browse(p):
         crumbs.append({"name": seg, "rel": "/".join(acc)})
     nd = sum(1 for e in entries if e["is_dir"])
     nf = len(entries) - nd
+    user = current_user() if PAGES_ENABLED else None
     return render_template_string(
-        PAGE, entries=entries, cur=rel, crumbs=crumbs, nd=nd, nf=nf,
+        PAGE, user=user, csrf=csrf_token() if user else "", pages_on=PAGES_ENABLED, nav="files",
+        entries=entries, cur=rel, crumbs=crumbs, nd=nd, nf=nf,
         dest_label=" / ".join(c["name"] for c in crumbs),
         total=human(sum(e["bytes"] for e in entries)),
         need_pw=PROTECT_UPLOAD, title=APP_TITLE, max_mb=MAX_UPLOAD_MB, max_w=PAGE_MAX_WIDTH)
@@ -753,6 +905,568 @@ def download(filepath):
     if os.path.islink(target) or not os.path.isfile(target):
         abort(404)
     return send_from_directory(full, name, as_attachment=True)
+
+
+# ---------- templates for sign-in, pages and messages (share CSS + header with the file page) ----------
+_TOP = HEAD + "/*CSS*/</style></head>\n<body>\n<!--HEADER-->\n"
+
+
+def _build(t):
+    return t.replace("/*CSS*/", CSS_BASE + CSS_EXTRA).replace("<!--HEADER-->", HEADER)
+
+
+LOGIN_TMPL = _build(_TOP + r"""
+<main class="wrap">
+  <section class="panel login" aria-labelledby="lh">
+    <div class="phead"><h2 id="lh">Sign in</h2><span class="sub">to view and publish pages</span></div>
+    <div class="pbody">
+    {% if not configured %}
+      <p class="note err" role="alert" style="margin:0">No user accounts exist yet.</p>
+      <p class="sub" style="margin:14px 0 0">An administrator creates accounts on the server:</p>
+      <pre class="code">python3 manage_users.py add yourname --role admin</pre>
+    {% else %}
+      <form method="post" action="{{ url_for('login') }}">
+        <input type="hidden" name="csrf" value="{{ csrf }}">
+        <input type="hidden" name="next" value="{{ nxt }}">
+        <label class="f" for="u" style="margin-top:0">{{ 'Your name' if shared else 'Username' }}</label>
+        <input class="fld" id="u" name="username" type="text" autocomplete="{{ 'name' if shared else 'username' }}" autocapitalize="none" spellcheck="false" required autofocus maxlength="32" value="{{ username }}">
+        {% if shared %}<p class="hint">Shown as “Uploaded by” on the pages you publish.</p>{% endif %}
+        <label class="f" for="p">Password</label>
+        <input class="fld" id="p" name="password" type="password" autocomplete="current-password" required>
+        {% if error %}<div class="note err" role="alert">{{ error }}</div>{% endif %}
+        <button class="btn" type="submit">Sign in</button>
+      </form>
+    {% endif %}
+    </div>
+  </section>
+</main>
+</body></html>
+""")
+
+MSG_TMPL = _build(_TOP + r"""
+<main class="wrap">
+  <section class="panel login" aria-labelledby="lh">
+    <div class="phead"><h2 id="lh">{{ heading }}</h2></div>
+    <div class="pbody">
+      <p style="margin:0 0 16px">{{ text }}</p>
+      <a class="dl" href="{{ url_for('pages') }}">Back to pages</a>
+    </div>
+  </section>
+</main>
+</body></html>
+""")
+
+PAGES_TMPL = _build(_TOP + r"""
+<main class="wrap grid">
+  <section class="panel upload" aria-labelledby="ph">
+    <div class="phead"><h2 id="ph">Publish a page</h2><span class="sub">Up to {{ page_mb }} MB</span></div>
+    <div class="pbody">
+      {% if errors.form %}<div class="note err" role="alert" style="margin:0 0 14px">{{ errors.form }}</div>{% endif %}
+      <form method="post" action="{{ url_for('publish') }}" enctype="multipart/form-data" id="pf">
+        <input type="hidden" name="csrf" value="{{ csrf }}">
+
+        <label class="f" for="title" style="margin-top:0">Title <span class="req" aria-hidden="true">*</span></label>
+        <input class="fld" id="title" name="title" type="text" required maxlength="120" autocomplete="off" value="{{ form.title }}"{% if errors.title %} aria-invalid="true" aria-describedby="e-title"{% endif %}>
+        {% if errors.title %}<p class="ferr" id="e-title">{{ errors.title }}</p>{% endif %}
+
+        <label class="f" for="category">Category <span class="req" aria-hidden="true">*</span></label>
+        <input class="fld" id="category" name="category" type="text" required maxlength="60" autocomplete="off" list="cats" value="{{ form.category }}"{% if errors.category %} aria-invalid="true" aria-describedby="e-cat"{% endif %}>
+        <datalist id="cats">{% for c, n in cats %}<option value="{{ c }}">{% endfor %}</datalist>
+        {% if errors.category %}<p class="ferr" id="e-cat">{{ errors.category }}</p>{% endif %}
+
+        {% if not shared %}
+        <label class="f" for="viewers">Who can view</label>
+        <input class="fld" id="viewers" name="viewers" type="text" autocomplete="off" spellcheck="false" placeholder="Everyone signed in" value="{{ form.viewers }}"{% if errors.viewers %} aria-invalid="true" aria-describedby="e-view"{% endif %}>
+        {% if errors.viewers %}<p class="ferr" id="e-view">{{ errors.viewers }}</p>{% endif %}
+        <p class="hint">Leave empty for everyone signed in, or list usernames and <code>@groups</code> separated by commas, for example <code>alice, @ops</code>.{% if groups %} Groups: {% for g in groups %}@{{ g }}{{ ', ' if not loop.last }}{% endfor %}.{% endif %} You and admins can always open it.</p>
+        {% endif %}
+
+        <label class="f" for="file">HTML file <span class="req" aria-hidden="true">*</span></label>
+        <input class="fld" id="file" name="file" type="file" accept=".html,.htm,text/html" required{% if errors.file %} aria-invalid="true" aria-describedby="e-file"{% endif %}>
+        {% if errors.file %}<p class="ferr" id="e-file">{{ errors.file }}</p>{% endif %}
+        <p class="ferr" id="e-size" hidden></p>
+
+        {% if need_pw %}
+        <label class="f" for="pw">Upload password <span class="req" aria-hidden="true">*</span></label>
+        <input class="fld" id="pw" name="password" type="password" required autocomplete="off"{% if errors.password %} aria-invalid="true" aria-describedby="e-pw"{% endif %}>
+        {% if errors.password %}<p class="ferr" id="e-pw">{{ errors.password }}</p>{% endif %}
+        <p class="hint">The same password used to upload files.</p>
+        {% endif %}
+
+        <button class="btn" type="submit" id="pub">Publish</button>
+      </form>
+      <p class="rule">Use one self-contained .html file with its CSS, scripts and images inline. Published pages can’t be replaced or deleted. Publish a new page to change one, and {{ 'unpublish a page' if shared else 'unpublish a page you own' }} at any time.{% if sandbox %} Scripts in pages run in an isolated sandbox, so pages can’t use cookies or local storage.{% endif %}</p>
+    </div>
+  </section>
+
+  <section class="panel" aria-labelledby="lh">
+    <div class="phead">
+      <div><h2 id="lh">Pages</h2><span class="sub num" id="stats">{{ rows|length }} page{{ '' if rows|length == 1 else 's' }} · {{ cats|length }} categor{{ 'y' if cats|length == 1 else 'ies' }}</span></div>
+      <div class="tools"><div class="search">
+        <svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="M20 20l-3.5-3.5"/></svg>
+        <input id="q" type="search" placeholder="Search pages" aria-label="Search pages by title, category or author">
+      </div></div>
+    </div>
+    {% with m = get_flashed_messages() %}{% if m %}<div class="flash">{% for x in m %}<p class="note ok" role="status">{{ x }}</p>{% endfor %}</div>{% endif %}{% endwith %}
+    {% if cats %}
+    <div class="chips" id="chips" role="group" aria-label="Filter by category">
+      <button type="button" class="chip" data-cat="" aria-pressed="true">All<span class="num">{{ rows|length }}</span></button>
+      {% for c, n in cats %}<button type="button" class="chip" data-cat="{{ c }}" aria-pressed="false">{{ c }}<span class="num">{{ n }}</span></button>{% endfor %}
+    </div>
+    {% endif %}
+    <div class="scroll"><table>
+      <thead><tr>
+        <th scope="col" aria-sort="none"><button type="button" data-key="title">Title</button></th>
+        <th scope="col" aria-sort="none"><button type="button" data-key="cat">Category</button></th>
+        <th scope="col" class="hide-md" aria-sort="none"><button type="button" data-key="by">Uploaded by</button></th>
+        <th scope="col" class="hide-sm" aria-sort="descending"><button type="button" data-key="ts">Uploaded</button></th>
+        <th scope="col">Status</th>
+        {% if not shared %}<th scope="col" class="hide-md">Who can view</th>{% endif %}
+        <th scope="col" class="r"><span class="sr">Actions</span></th>
+      </tr></thead>
+      <tbody id="rows">
+        {% for r in rows %}
+        <tr data-title="{{ r.title|lower }}" data-cat="{{ r.category }}" data-by="{{ r.uploaded_by }}" data-ts="{{ r.ts }}">
+          <td><a class="fname" href="{{ url_for('view_page', pid=r.id) }}" target="_blank" rel="noopener">{{ r.title }}</a>
+              <div class="stored" title="Stored filename">{{ r.stored_filename }} · {{ r.size }}</div></td>
+          <td><span class="tag">{{ r.category }}</span></td>
+          <td class="hide-md">{{ r.uploaded_by }}</td>
+          <td class="num hide-sm">{{ r.uploaded }}</td>
+          <td><span class="pill {{ 'ok' if r.published else 'off' }}">{{ 'Published' if r.published else 'Unpublished' }}</span></td>
+          {% if not shared %}<td class="hide-md"><div class="vw">{% if r.everyone %}<span class="sub">Everyone signed in</span>{% else %}{% for v in r.viewers %}<span class="tag">{{ v }}</span>{% endfor %}{% endif %}</div></td>{% endif %}
+          <td class="r"><div class="act">
+            <a class="dl" href="{{ url_for('view_page', pid=r.id) }}" target="_blank" rel="noopener" aria-label="Open {{ r.title }}">Open</a>
+            {% if r.can_manage %}
+            <form method="post" action="{{ url_for('set_status', pid=r.id) }}">
+              <input type="hidden" name="csrf" value="{{ csrf }}">
+              <input type="hidden" name="status" value="{{ 'unpublished' if r.published else 'published' }}">
+              <button class="mini" type="submit" aria-label="{{ 'Unpublish' if r.published else 'Publish' }} {{ r.title }}">{{ 'Unpublish' if r.published else 'Publish' }}</button>
+            </form>
+            {% endif %}
+          </div></td>
+        </tr>
+        {% endfor %}
+        <tr class="empty" id="empty" {% if rows %}hidden{% endif %}><td colspan="{{ 6 if shared else 7 }}" id="emptytxt">No pages yet. Publish the first one with the form.</td></tr>
+      </tbody>
+    </table></div>
+  </section>
+</main>
+
+<script>
+(function(){
+  var $=function(i){return document.getElementById(i)};
+  var tbody=$('rows'), empty=$('empty'), q=$('q'), cat='', key='ts', dir=-1, MAXB={{ page_mb }}*1048576;
+  function rows(){return Array.prototype.slice.call(tbody.querySelectorAll('tr[data-title]'))}
+  function apply(){
+    var term=q.value.trim().toLowerCase(), shown=0, all=rows();
+    all.forEach(function(r){
+      var hay=r.dataset.title+' '+r.dataset.cat.toLowerCase()+' '+r.dataset.by;
+      var ok=(!cat||r.dataset.cat===cat)&&(!term||hay.indexOf(term)!==-1);
+      r.hidden=!ok; if(ok)shown++;
+    });
+    if(!all.length){empty.hidden=false}
+    else{empty.hidden=shown>0; $('emptytxt').textContent='No pages match this filter.'}
+  }
+  q.addEventListener('input',apply);
+  var chips=$('chips');
+  if(chips){chips.addEventListener('click',function(e){
+    var b=e.target.closest('.chip'); if(!b)return;
+    Array.prototype.forEach.call(chips.querySelectorAll('.chip'),function(c){c.setAttribute('aria-pressed',c===b?'true':'false')});
+    cat=b.dataset.cat; apply();
+  })}
+  Array.prototype.forEach.call(document.querySelectorAll('th button[data-key]'),function(b){
+    b.onclick=function(){
+      var k=b.dataset.key; dir=(key===k)?-dir:(k==='ts'?-1:1); key=k;
+      rows().sort(function(a,c){
+        var x=a.dataset[k], y=c.dataset[k];
+        if(k==='ts'){return (parseFloat(x)-parseFloat(y))*dir}
+        return String(x).toLowerCase().localeCompare(String(y).toLowerCase())*dir;
+      }).forEach(function(r){tbody.insertBefore(r,empty)});
+      Array.prototype.forEach.call(document.querySelectorAll('th[aria-sort]'),function(th){th.setAttribute('aria-sort','none')});
+      b.parentNode.setAttribute('aria-sort',dir===1?'ascending':'descending');
+    };
+  });
+  var file=$('file'), esz=$('e-size'), pub=$('pub');
+  file.addEventListener('change',function(){
+    var f=file.files[0];
+    if(f && f.size>MAXB){esz.textContent='That file is '+(f.size/1048576).toFixed(1)+' MB. The limit is {{ page_mb }} MB.';esz.hidden=false;file.value=''}
+    else{esz.hidden=true}
+  });
+  $('pf').addEventListener('submit',function(){pub.disabled=true;pub.textContent='Publishing\u2026'});
+})();
+</script>
+</body></html>
+""")
+
+
+# ===================================================================
+# Hosted HTML pages: accounts, publishing, per-user / per-group viewing
+# ===================================================================
+DUMMY_HASH = generate_password_hash("not-a-real-password")   # equalises login timing
+SANDBOX_CSP = ("sandbox allow-scripts allow-popups allow-popups-to-escape-sandbox "
+               "allow-downloads allow-modals")
+HTML_HINT = re.compile(rb"<\s*(!doctype|html|head|body|div|p|h[1-6]|table|svg|section|main|article|script|style)\b", re.I)
+CATEGORY_RE = re.compile(r"[\w &/.\-]{1,60}")
+
+_users_cache = {"mtime": None, "data": {}}
+
+
+def load_users():
+    """Accounts from users.json (made by manage_users.py). Re-read when the file changes."""
+    try:
+        mtime = USERS_FILE.stat().st_mtime
+    except OSError:
+        return {}
+    if _users_cache["mtime"] != mtime:
+        try:
+            raw = json.loads(USERS_FILE.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {}
+        data = {}
+        for name, u in (raw.get("users") or {}).items():
+            data[name] = {"name": name, "hash": u.get("password_hash", ""),
+                          "groups": sorted({str(g).lower() for g in u.get("groups", [])}),
+                          "role": "admin" if u.get("role") == "admin" else "user"}
+        _users_cache.update(mtime=mtime, data=data)
+    return _users_cache["data"]
+
+
+NAME_OK = re.compile(r"[\w .\-]{2,32}")
+
+
+def current_user():
+    name = session.get("user")
+    if not name:
+        return None
+    if SHARED_MODE:
+        if session.get("mode") != "shared":
+            return None
+        # one shared password: everyone signed in has the same rights, the name is only a label
+        return {"name": name, "groups": [], "role": "admin", "shared": True}
+    if session.get("mode") != "accounts":
+        return None
+    return load_users().get(name)
+
+
+def csrf_token():
+    if not session.get("csrf"):
+        session["csrf"] = secrets.token_hex(16)
+    return session["csrf"]
+
+
+def csrf_ok():
+    sent = request.form.get("csrf", "").encode()
+    good = session.get("csrf", "").encode()
+    return bool(good) and hmac.compare_digest(sent, good)
+
+
+def safe_next(url):
+    return url if url.startswith("/") and not url.startswith("//") and "\\" not in url else ""
+
+
+def login_required(fn):
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        if not current_user():
+            nxt = request.full_path.rstrip("?") if request.method == "GET" else url_for("pages")
+            return redirect(url_for("login", next=nxt))
+        return fn(*args, **kwargs)
+    return wrapper
+
+
+# ---------- metadata database (SQLite: safe with several gunicorn workers) ----------
+def db():
+    con = sqlite3.connect(PAGES_DB, timeout=15)
+    con.row_factory = sqlite3.Row
+    return con
+
+
+def query(sql, args=()):
+    with closing(db()) as con:
+        return con.execute(sql, args).fetchall()
+
+
+def execute(sql, args=()):
+    with closing(db()) as con, con:
+        return con.execute(sql, args).lastrowid
+
+
+def init_pages():
+    os.makedirs(PAGE_FILES_DIR, mode=0o750, exist_ok=True)
+    execute("""CREATE TABLE IF NOT EXISTS pages (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        title TEXT NOT NULL,
+        category TEXT NOT NULL,
+        stored_filename TEXT NOT NULL UNIQUE,
+        original_filename TEXT,
+        uploaded_by TEXT NOT NULL,
+        uploaded_at REAL NOT NULL,
+        status TEXT NOT NULL DEFAULT 'published',
+        viewer_users TEXT NOT NULL DEFAULT '[]',
+        viewer_groups TEXT NOT NULL DEFAULT '[]',
+        size INTEGER NOT NULL DEFAULT 0)""")
+
+
+def can_manage(row, user):
+    return bool(user) and (user["role"] == "admin" or row["uploaded_by"] == user["name"])
+
+
+def can_view(row, user):
+    if not user:
+        return False
+    if can_manage(row, user):
+        return True            # owner and admins can always open it (even when unpublished)
+    if row["status"] != "published":
+        return False
+    vu, vg = json.loads(row["viewer_users"]), json.loads(row["viewer_groups"])
+    if not vu and not vg:
+        return True            # no restriction: every signed-in user
+    return user["name"] in vu or bool(set(vg) & set(user["groups"]))
+
+
+def page_view(row, user):
+    vu, vg = json.loads(row["viewer_users"]), json.loads(row["viewer_groups"])
+    return {"id": row["id"], "title": row["title"], "category": row["category"],
+            "stored_filename": row["stored_filename"], "uploaded_by": row["uploaded_by"],
+            "ts": row["uploaded_at"],
+            "uploaded": time.strftime("%Y-%m-%d %H:%M", time.localtime(row["uploaded_at"])),
+            "published": row["status"] == "published", "size": human(row["size"] or 0),
+            "everyone": not (vu or vg), "viewers": vu + ["@" + g for g in vg],
+            "can_manage": can_manage(row, user)}
+
+
+def parse_viewers(text, users):
+    """'alice, @ops' -> (['alice'], ['ops'], None). Empty or 'everyone' = no restriction."""
+    toks = [t for t in re.split(r"[,;\s]+", (text or "").strip().lower()) if t]
+    groups = {g for u in users.values() for g in u["groups"]}
+    vu, vg, bad = [], [], []
+    for t in toks:
+        if t in ("everyone", "*", "all"):
+            return [], [], None
+        if t.startswith("@"):
+            (vg if t[1:] in groups else bad).append(t[1:] if t[1:] in groups else t)
+        else:
+            (vu if t in users else bad).append(t)
+    if bad:
+        return [], [], "Unknown user or group: " + ", ".join(dict.fromkeys(bad)) + "."
+    return list(dict.fromkeys(vu)), list(dict.fromkeys(vg)), None
+
+
+def check_html(data):
+    """Return an error message if `data` is not an acceptable HTML page, else None."""
+    if not data.strip():
+        return "The file is empty."
+    if len(data) > PAGE_MAX_MB * 1024 * 1024:
+        return f"The file is larger than {PAGE_MAX_MB} MB."
+    if b"\x00" in data:
+        return "That doesn\u2019t look like an HTML file."
+    try:
+        data.decode("utf-8")
+    except UnicodeDecodeError:
+        return "The file must be saved as UTF-8."
+    if not HTML_HINT.search(data[:65536]):
+        return "That doesn\u2019t look like an HTML page (no HTML tags found)."
+    return None
+
+
+def render_pages(errors=None, form=None, status=200):
+    user = current_user()
+    rows = [page_view(r, user) for r in query("SELECT * FROM pages ORDER BY uploaded_at DESC")
+            if can_view(r, user)]
+    counts = {}
+    for r in rows:
+        counts[r["category"]] = counts.get(r["category"], 0) + 1
+    cats = sorted(counts.items(), key=lambda kv: kv[0].lower())
+    groups = sorted({g for u in load_users().values() for g in u["groups"]})
+    return render_template_string(
+        PAGES_TMPL, rows=rows, cats=cats, errors=errors or {}, groups=groups,
+        form=form or {"title": "", "category": "", "viewers": ""},
+        user=user, csrf=csrf_token(), sandbox=PAGE_SANDBOX, page_mb=PAGE_MAX_MB, need_pw=PROTECT_UPLOAD,
+        shared=SHARED_MODE,
+        title=APP_TITLE, max_w=PAGE_MAX_WIDTH, pages_on=True, nav="pages",
+        ptitle=f"Pages \u00b7 {APP_TITLE}",
+        badge="Pages are never deleted or replaced",
+        badge_hint="Pages can be published and unpublished. They can\u2019t be deleted or replaced."), status
+
+
+def msg_page(heading, text, status):
+    user = current_user()
+    return render_template_string(
+        MSG_TMPL, heading=heading, text=text, user=user, csrf=csrf_token(),
+        title=APP_TITLE, max_w=PAGE_MAX_WIDTH, pages_on=True, nav="pages",
+        ptitle=f"{heading} \u00b7 {APP_TITLE}",
+        badge="Pages are never deleted or replaced"), status
+
+
+# ---------- routes: sign in / out ----------
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    users = load_users()
+    nxt = safe_next(request.values.get("next", ""))
+    error, username, status = "", "", 200
+    if request.method == "POST":
+        ip = "login:" + client_ip()
+        if SHARED_MODE:
+            username = " ".join((request.form.get("username") or "").split())
+        else:
+            username = (request.form.get("username") or "").strip().lower()
+        if not csrf_ok():
+            error, status = "Your session expired. Please try again.", 400
+        elif locked_out(ip):
+            error, status = "Too many failed sign-ins. Try again in a few minutes.", 429
+        elif SHARED_MODE and not NAME_OK.fullmatch(username):
+            error, status = "Enter your name (2 to 32 letters, numbers, spaces, dots, dashes or underscores).", 400
+        else:
+            pw = request.form.get("password", "")
+            if SHARED_MODE:
+                good = password_ok(pw)
+                who = username
+            else:
+                u = users.get(username)
+                good = check_password_hash(u["hash"] if u else DUMMY_HASH, pw) and bool(u)
+                who = username
+            if good:
+                _fails.pop(ip, None)
+                session.clear()
+                session.permanent = True
+                session["user"] = who
+                session["mode"] = "shared" if SHARED_MODE else "accounts"
+                return redirect(nxt or url_for("pages"))
+            _fails.setdefault(ip, []).append(time.time())
+            error, status = ("Wrong password." if SHARED_MODE else "Wrong username or password."), 401
+    return render_template_string(
+        LOGIN_TMPL, configured=SHARED_MODE or bool(users), shared=SHARED_MODE, error=error,
+        username=username, nxt=nxt, user=None, csrf=csrf_token(), title=APP_TITLE,
+        max_w=PAGE_MAX_WIDTH, pages_on=True, nav="pages", ptitle=f"Sign in \u00b7 {APP_TITLE}",
+        badge="Pages need a sign-in"), status
+
+
+@app.post("/logout")
+def logout():
+    if csrf_ok():
+        session.clear()
+    return redirect(url_for("login"))
+
+
+# ---------- routes: pages ----------
+@app.get("/pages")
+@login_required
+def pages():
+    return render_pages()
+
+
+@app.post("/pages/publish")
+@login_required
+def publish():
+    user = current_user()
+    if not csrf_ok():
+        body, _ = render_pages(errors={"form": "Your session expired. Reload the page and try again."})
+        return body, 400
+    title = " ".join((request.form.get("title") or "").split())
+    category = " ".join((request.form.get("category") or "").split())
+    viewers = (request.form.get("viewers") or "").strip()
+    f = request.files.get("file")
+    bad = check_password()      # same shared upload password as the file area (when PROTECT_UPLOAD is on)
+    if bad:
+        body, _ = render_pages(errors={"password": bad[0]},
+                               form={"title": title, "category": category, "viewers": viewers})
+        return body, bad[1]
+    errors = {}
+    if not title:
+        errors["title"] = "Enter a title."
+    elif len(title) > 120:
+        errors["title"] = "Keep the title under 120 characters."
+    if not category:
+        errors["category"] = "Enter a category."
+    elif not CATEGORY_RE.fullmatch(category):
+        errors["category"] = "Use up to 60 letters, numbers, spaces, - _ . / or &."
+    vu, vg, verr = ([], [], None) if SHARED_MODE else parse_viewers(viewers, load_users())
+    if verr:
+        errors["viewers"] = verr
+    data = b""
+    if not f or not f.filename:
+        errors["file"] = "Choose an HTML file."
+    elif not f.filename.lower().endswith((".html", ".htm")):
+        errors["file"] = "Only .html or .htm files are accepted."
+    else:
+        data = f.read(PAGE_MAX_MB * 1024 * 1024 + 1)
+        errors_file = check_html(data)
+        if errors_file:
+            errors["file"] = errors_file
+    if errors:
+        body, _ = render_pages(errors=errors, form={"title": title, "category": category, "viewers": viewers})
+        return body, 400
+    slug = re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")[:40] or "page"
+    stored = f"{secrets.token_hex(6)}-{slug}.html"
+    path = os.path.join(PAGE_FILES_DIR, stored)
+    with open(path, "xb") as fh:
+        fh.write(data)
+    os.chmod(path, 0o640)
+    execute("""INSERT INTO pages (title, category, stored_filename, original_filename, uploaded_by,
+               uploaded_at, status, viewer_users, viewer_groups, size)
+               VALUES (?, ?, ?, ?, ?, ?, 'published', ?, ?, ?)""",
+            (title, category, stored, secure_filename(f.filename), user["name"], time.time(),
+             json.dumps(vu), json.dumps(vg), len(data)))
+    flash(f"Published \u201c{title}\u201d in {category}.")
+    return redirect(url_for("pages"))
+
+
+@app.post("/pages/<int:pid>/status")
+@login_required
+def set_status(pid):
+    user = current_user()
+    if not csrf_ok():
+        return msg_page("Session expired", "Reload the page and try again.", 400)
+    rows = query("SELECT * FROM pages WHERE id = ?", (pid,))
+    if not rows:
+        abort(404)
+    row = rows[0]
+    if not can_manage(row, user):
+        return msg_page("Not allowed", "Only the person who published a page, or an admin, can change its status.", 403)
+    new = "published" if request.form.get("status") == "published" else "unpublished"
+    execute("UPDATE pages SET status = ? WHERE id = ?", (new, pid))
+    flash(f"\u201c{row['title']}\u201d is now {new}.")
+    return redirect(url_for("pages"))
+
+
+@app.get("/p/<int:pid>")
+def view_page(pid):
+    user = current_user()
+    if not user:
+        return redirect(url_for("login", next=request.path))
+    rows = query("SELECT * FROM pages WHERE id = ?", (pid,))
+    if not rows:
+        return msg_page("Page not found", "This page doesn\u2019t exist.", 404)
+    row = rows[0]
+    if not can_view(row, user):
+        return msg_page("No access", "You don\u2019t have permission to view this page, or it isn\u2019t published.", 403)
+    path = os.path.join(PAGE_FILES_DIR, row["stored_filename"])
+    if not os.path.isfile(path):
+        return msg_page("Page not found", "The file for this page is missing on the server.", 404)
+    resp = send_from_directory(PAGE_FILES_DIR, row["stored_filename"], mimetype="text/html")
+    resp.headers["Cache-Control"] = "private, no-store"
+    resp.headers["Referrer-Policy"] = "no-referrer"
+    if PAGE_SANDBOX:
+        # Opaque origin: scripts in the page can't use this site's cookies or call its endpoints.
+        resp.headers["Content-Security-Policy"] = SANDBOX_CSP
+    return resp
+
+
+@app.after_request
+def security_headers(resp):
+    resp.headers.setdefault("X-Content-Type-Options", "nosniff")
+    resp.headers.setdefault("X-Frame-Options", "DENY")
+    return resp
+
+
+if PAGES_ENABLED:
+    try:
+        init_pages()
+    except OSError as e:
+        sys.exit(f"[FATAL] Cannot prepare the pages folder {PAGES_DIR}: {e}")
+    print(f"[fileshare] pages enabled | folder: {PAGES_DIR} | sign-in: "
+          + ("shared password" if SHARED_MODE else f"accounts ({len(load_users())} in {USERS_FILE})"),
+          file=sys.stderr)
 
 
 @app.errorhandler(413)
