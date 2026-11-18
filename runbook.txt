@@ -11,3 +11,36 @@ pip3 install --no-cache-dir -r requirements.txt
 
 
 nohup /FileNest/venv/bin/gunicorn -w 2 --timeout 600 -b 0.0.0.0:8080 app:app  > logs.txt 2>&1 &
+
+
+From any location 
+nohup /FileNest/venv/bin/gunicorn -w 2 --timeout 600 -b 0.0.0.0:8080 --chdir /FileNest app:app > logs.txt 2>&1 &
+
+##############################
+
+vi  /etc/systemd/system/filenest.service
+[Unit]
+Description=FileNest Gunicorn Application
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/FileNest
+
+ExecStart=/FileNest/venv/bin/gunicorn -w 2 --timeout 600 -b 0.0.0.0:8080 --chdir /FileNest app:app
+
+Restart=always
+RestartSec=5
+
+StandardOutput=append:/FileNest/logs.txt
+StandardError=append:/FileNest/logs.txt
+
+[Install]
+WantedBy=multi-user.target
+###################################################################
+systemctl daemon-reload
+systemctl enable filenest
+systemctl start filenest
+
+
