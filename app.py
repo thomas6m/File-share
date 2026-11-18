@@ -1,25 +1,32 @@
 #!/usr/bin/env python3
 """
-Simple file share with folders: upload, download and create folders only
-(no delete, no overwrite, no rename).
+Simple file share with folders: upload, download, create folders and delete.
+
+Every file and folder is either PUBLIC or PRIVATE:
+  * public  - anyone who can reach the page can see it in the list and download it
+  * private - hidden until the visitor unlocks private files with the password
+              (needed even to see the name, open the folder or download)
+A private folder makes everything inside it private.
+
+Uploading, creating folders, deleting and changing public/private always ask
+for the password, on every action, whether or not private files are unlocked.
+Files are never overwritten: a name clash gets a timestamp suffix.
 """
 import os
 import sys
+import shutil
 import hmac
 import time
 import re
-import json
 import hashlib
 import secrets
 import sqlite3
 from contextlib import closing
-from functools import wraps
 from pathlib import Path
 from datetime import datetime, timedelta
-from flask import (Flask, request, redirect, url_for, flash,
-                   send_from_directory, render_template_string, Response, abort, session)
+from flask import (Flask, request, redirect, url_for, flash, g,
+                   send_from_directory, render_template_string, abort, session)
 from werkzeug.utils import secure_filename
-from werkzeug.security import check_password_hash, generate_password_hash
 from cryptography.fernet import Fernet
 
 # =====================================================================
@@ -33,30 +40,27 @@ SECRETS_DIR   = ""                 # folder with .fernet.key and .password.enc (
 MAX_UPLOAD_MB = 2048               # max size of ONE upload request (all files in it combined), in MB
 HOST          = "0.0.0.0"          # bind address
 PORT          = 8080               # listen port
-PROTECT_DOWNLOAD = True            # True  = browser login prompt (AUTH_USER + password) needed to
-                                   #         view the file list and download
-                                   # False = anyone who can reach the page can download
-PROTECT_UPLOAD   = True            # True  = upload form asks for the password on every upload
-                                   # False = anyone who can reach the page can upload
-                                   # (both False = fully open; both use the password in SECRETS_DIR)
-AUTH_USER     = "fileshare"        # username for the download login prompt
+DEFAULT_VISIBILITY = "private"     # "private" or "public": used for files and folders that have no
+                                   # setting yet (anything copied in by hand, or that existed before
+                                   # this version) and pre-selected in the upload form.
+                                   # Upload, new folder, delete and public/private changes always
+                                   # need the password in SECRETS_DIR.
+FILES_DB      = ""                 # public/private settings; "" = <current working dir>/fileshare-meta/files.db
+                                   # (must be outside SHARE_DIR)
 APP_TITLE     = "FileNest"         # name shown in the page header and browser tab
 APP_TAGLINE   = "Your files. Your pages. One place."   # line under the name in the header
 PAGE_MAX_WIDTH = "100%"            # page width cap: "100%" = fill the window, or e.g. "1400px" / "90vw"
 MAX_FOLDER_DEPTH = 8              # how many folder levels deep users can create
-PAGES_ENABLED = True               # host static HTML pages
-PAGES_LOGIN   = "shared"           # "shared"   = sign in with the same shared password as uploads, plus a display name
-                                   #              (shown as "Uploaded by"; everyone signed in sees every page)
-                                   # "accounts" = personal accounts from manage_users.py, with per-user and per-group
-                                   #              viewing and a trusted "Uploaded by"
+AUTH_USER     = "fileshare"        # the single account. Only its password is ever asked for (no username
+                                   # prompt); the name is shown as "Uploaded by" on pages.
+PAGES_ENABLED = True               # host static HTML pages (each one public or private, like files)
 PAGES_DIR     = ""                 # pages and their metadata; "" = <current working dir>/pages
-USERS_FILE    = ""                 # user accounts; "" = <SECRETS_DIR>/users.json
 PAGE_MAX_MB   = 20                 # max size of one HTML page, in MB
 PAGE_SANDBOX  = True               # run hosted pages in an isolated sandbox (recommended; see README)
-SESSION_HOURS = 8                  # how long a page sign-in lasts
+SESSION_HOURS = 8                  # how long "Unlock private" lasts in a browser
 COOKIE_SECURE = False              # set True when the app is served over HTTPS
-MAX_FAILED    = 5                  # wrong upload passwords allowed per client IP ...
-LOCKOUT_SEC   = 300                # ... within this many seconds, then uploads are blocked
+MAX_FAILED    = 5                  # wrong passwords allowed per client IP ...
+LOCKOUT_SEC   = 300                # ... within this many seconds, then password checks are blocked
 SHOW_HIDDEN   = False              # list files starting with "." ?
 # =====================================================================
 
@@ -65,7 +69,13 @@ SECRETS_DIR   = Path(os.environ.get("SECRETS_DIR") or SECRETS_DIR or Path.cwd() 
 MAX_UPLOAD_MB = int(os.environ.get("MAX_UPLOAD_MB", MAX_UPLOAD_MB))
 HOST          = os.environ.get("HOST", HOST)
 PORT          = int(os.environ.get("PORT", PORT))
-USER          = os.environ.get("SHARE_USER", AUTH_USER)
+DEFAULT_VISIBILITY = os.environ.get("DEFAULT_VISIBILITY", DEFAULT_VISIBILITY).strip().lower()
+if DEFAULT_VISIBILITY not in ("public", "private"):
+    sys.exit('[FATAL] DEFAULT_VISIBILITY must be "public" or "private".')
+FILES_DB      = os.path.abspath(os.environ.get("FILES_DB") or FILES_DB
+                                or os.path.join(os.getcwd(), "fileshare-meta", "files.db"))
+if os.path.realpath(FILES_DB).startswith(os.path.realpath(SHARE_DIR) + os.sep):
+    sys.exit("[FATAL] FILES_DB must not be inside SHARE_DIR (it would be downloadable).")
 
 
 def env_bool(name, default):
@@ -73,22 +83,20 @@ def env_bool(name, default):
     return default if v is None else v.strip().lower() in ("1", "true", "yes", "on")
 
 
-PROTECT_DOWNLOAD = env_bool("PROTECT_DOWNLOAD", PROTECT_DOWNLOAD)
-PROTECT_UPLOAD   = env_bool("PROTECT_UPLOAD", PROTECT_UPLOAD)
+for _old in ("PROTECT_DOWNLOAD", "PROTECT_UPLOAD", "SHARE_USER", "PAGES_LOGIN", "USERS_FILE"):
+    if os.environ.get(_old) is not None:
+        print(f"[fileshare] note: {_old} is no longer used (one password for everything; files and "
+              f"pages are public or private one by one)", file=sys.stderr)
+AUTH_USER        = os.environ.get("AUTH_USER", AUTH_USER).strip() or "fileshare"
 PAGES_ENABLED    = env_bool("PAGES_ENABLED", PAGES_ENABLED)
-PAGES_LOGIN      = os.environ.get("PAGES_LOGIN", PAGES_LOGIN).strip().lower()
-if PAGES_LOGIN not in ("shared", "accounts"):
-    sys.exit('[FATAL] PAGES_LOGIN must be "shared" or "accounts".')
-SHARED_MODE      = PAGES_ENABLED and PAGES_LOGIN == "shared"
 PAGE_SANDBOX     = env_bool("PAGE_SANDBOX", PAGE_SANDBOX)
 COOKIE_SECURE    = env_bool("COOKIE_SECURE", COOKIE_SECURE)
 PAGE_MAX_MB      = int(os.environ.get("PAGE_MAX_MB", PAGE_MAX_MB))
 SESSION_HOURS    = float(os.environ.get("SESSION_HOURS", SESSION_HOURS))
 PAGES_DIR        = os.path.abspath(os.environ.get("PAGES_DIR") or PAGES_DIR or os.path.join(os.getcwd(), "pages"))
-USERS_FILE       = Path(os.environ.get("USERS_FILE") or USERS_FILE or SECRETS_DIR / "users.json")
 PAGE_FILES_DIR   = os.path.join(PAGES_DIR, "files")
 PAGES_DB         = os.path.join(PAGES_DIR, "pages.db")
-PAGE_PREFIXES    = ("/pages", "/p/", "/login", "/logout")   # routes that use user accounts, not the shared password
+PAGE_PREFIXES    = ("/pages", "/p/")   # 404 when PAGES_ENABLED is off
 SESSION_KEY_FILE = SECRETS_DIR / ".session.key"
 MAX_MB        = MAX_UPLOAD_MB
 SELF_NAME     = os.path.basename(os.path.abspath(__file__))  # never listed or served
@@ -106,15 +114,13 @@ def load_password():
     except Exception as e:
         sys.exit(f"[FATAL] Cannot load password from {SECRETS_DIR}: "
                  f"{type(e).__name__}: {e}\n"
-                 f"Run the encryption script first. (The password is needed while PROTECT_DOWNLOAD, PROTECT_UPLOAD "
-                 f"or the shared Pages login is on.)")
+                 f"Run the encryption script first. (The password unlocks private files and is "
+                 f"needed for every upload, new folder, delete, publish and public/private change.)")
 
 
-PASSWORD = load_password() if (PROTECT_DOWNLOAD or PROTECT_UPLOAD or SHARED_MODE) else None
-if PROTECT_DOWNLOAD and not USER:
-    sys.exit("[FATAL] PROTECT_DOWNLOAD is on but AUTH_USER is empty.")
-print(f"[fileshare] download protected: {PROTECT_DOWNLOAD} | upload protected: {PROTECT_UPLOAD}",
-      file=sys.stderr)
+PASSWORD = load_password()
+print(f"[fileshare] files are public or private one by one | default for new and unset items: "
+      f"{DEFAULT_VISIBILITY} | settings: {FILES_DB}", file=sys.stderr)
 
 os.makedirs(SHARE_DIR, exist_ok=True)
 
@@ -146,11 +152,9 @@ def _session_secret():
             os.unlink(tmp)
         return SESSION_KEY_FILE.read_text().strip()
     except OSError as e:
-        if PAGES_ENABLED:
-            sys.exit(f"[FATAL] Cannot create the session key in {SECRETS_DIR}: {e}\n"
-                     f"Fix the folder permissions or set the SECRET_KEY environment variable.")
-        # file-share only: the session just carries flash messages, a derived key is enough
-        return hashlib.sha256(b"fileshare-session:" + SHARE_DIR.encode()).hexdigest()
+        # no guessable fallback: the session says whether private files are unlocked
+        sys.exit(f"[FATAL] Cannot create the session key in {SECRETS_DIR}: {e}\n"
+                 f"Fix the folder permissions or set the SECRET_KEY environment variable.")
 
 
 app.secret_key = _session_secret()
@@ -164,20 +168,81 @@ app.config.update(
 app.jinja_env.globals["app_tagline"] = APP_TAGLINE
 
 
-# ---------- optional basic auth ----------
 @app.before_request
-def check_auth():
-    if request.path.startswith(PAGE_PREFIXES):
-        if not PAGES_ENABLED:
-            abort(404)
-        return          # hosted pages use user accounts and their own sign-in page
-    if not PROTECT_DOWNLOAD:
-        return
-    a = request.authorization
-    if not (a and hmac.compare_digest(a.username or "", USER)
-            and hmac.compare_digest(a.password or "", PASSWORD)):
-        return Response("Authentication required", 401,
-                        {"WWW-Authenticate": 'Basic realm="fileshare"'})
+def check_pages_enabled():
+    if request.path.startswith(PAGE_PREFIXES) and not PAGES_ENABLED:
+        abort(404)
+
+
+# ---------- public / private settings ----------
+def fdb():
+    con = sqlite3.connect(FILES_DB, timeout=15)
+    return con
+
+
+def init_files_db():
+    os.makedirs(os.path.dirname(FILES_DB), mode=0o750, exist_ok=True)
+    with closing(fdb()) as con, con:
+        con.execute("""CREATE TABLE IF NOT EXISTS items (
+            path TEXT PRIMARY KEY,                -- relative to SHARE_DIR, e.g. "reports/q3.pdf"
+            visibility TEXT NOT NULL CHECK (visibility IN ('public', 'private')),
+            updated_at REAL NOT NULL)""")
+
+
+def vis_map():
+    """{relative path: 'public' | 'private'} for every item with a setting (cached per request)."""
+    if "vis_map" not in g:
+        with closing(fdb()) as con:
+            g.vis_map = dict(con.execute("SELECT path, visibility FROM items"))
+    return g.vis_map
+
+
+def own_vis(rel, vmap=None):
+    """The item's own setting (DEFAULT_VISIBILITY when it has none)."""
+    return (vmap if vmap is not None else vis_map()).get(rel, DEFAULT_VISIBILITY)
+
+
+def effective_vis(rel, vmap=None):
+    """'private' if the item itself or any folder above it is private. The root is public."""
+    vmap = vmap if vmap is not None else vis_map()
+    parts = rel.split("/") if rel else []
+    for i in range(1, len(parts) + 1):
+        if own_vis("/".join(parts[:i]), vmap) == "private":
+            return "private"
+    return "public"
+
+
+def set_vis(rel, visibility):
+    with closing(fdb()) as con, con:
+        con.execute("INSERT OR REPLACE INTO items (path, visibility, updated_at) VALUES (?, ?, ?)",
+                    (rel, visibility, time.time()))
+    g.pop("vis_map", None)
+
+
+def forget_vis(rel):
+    """Drop the settings of an item and, for a folder, of everything inside it."""
+    prefix = rel + "/"
+    with closing(fdb()) as con, con:
+        con.execute("DELETE FROM items WHERE path = ? OR substr(path, 1, ?) = ?",
+                    (rel, len(prefix), prefix))
+    g.pop("vis_map", None)
+
+
+def _unlock_tag():
+    """Stored in the session when private files are unlocked. Tied to the current password,
+    so changing the password locks every browser again."""
+    return hmac.new(app.secret_key.encode(), b"files-unlock:" + PASSWORD.encode(),
+                    hashlib.sha256).hexdigest()[:32]
+
+
+def files_unlocked():
+    """True when this browser has unlocked private files and pages with the password."""
+    tag = session.get("files_ok")
+    return bool(tag) and hmac.compare_digest(tag, _unlock_tag())
+
+
+def can_see(rel):
+    return files_unlocked() or effective_vis(rel) == "public"
 
 
 # ---------- helpers ----------
@@ -266,19 +331,23 @@ def resolve_dir(rel):
     return rel, full
 
 
-def dir_stats(path, limit=20000):
+def dir_stats(path, rel, show_private, vmap, limit=20000):
     """(direct item count, total bytes of all files inside, truncated?) for a folder.
-    Symlinks and hidden entries are skipped; counting stops after `limit` entries."""
+    Symlinks and hidden entries are skipped; counting stops after `limit` entries.
+    Private items are left out of the counts unless show_private, so they leak nothing."""
     items = size = seen = 0
-    stack, top = [path], True
+    stack, top = [(path, rel)], True
     while stack:
-        cur = stack.pop()
+        cur, cur_rel = stack.pop()
         try:
             it = list(os.scandir(cur))
         except OSError:
             continue
         for e in it:
             if (e.name.startswith(".") and not SHOW_HIDDEN) or e.is_symlink():
+                continue
+            child = f"{cur_rel}/{e.name}"
+            if not show_private and own_vis(child, vmap) == "private":
                 continue
             if top:
                 items += 1
@@ -287,7 +356,7 @@ def dir_stats(path, limit=20000):
                 return items, size, True
             try:
                 if e.is_dir(follow_symlinks=False):
-                    stack.append(e.path)
+                    stack.append((e.path, child))
                 elif e.is_file(follow_symlinks=False):
                     size += e.stat(follow_symlinks=False).st_size
             except OSError:
@@ -296,50 +365,67 @@ def dir_stats(path, limit=20000):
     return items, size, False
 
 
-def list_dir(full, rel):
-    """Folders first (A-Z), then files (newest first). Symlinks and hidden entries are skipped."""
+def list_dir(full, rel, show_private):
+    """Folders first (A-Z), then files (newest first). Symlinks and hidden entries are skipped,
+    and so are private items unless show_private."""
+    vmap = vis_map()
+    parent_private = effective_vis(rel, vmap) == "private"
     dirs, files = [], []
     for e in os.scandir(full):
         if (e.name.startswith(".") and not SHOW_HIDDEN) or e.is_symlink():
             continue
         child = f"{rel}/{e.name}" if rel else e.name
+        vis = own_vis(child, vmap)
+        if not show_private and (parent_private or vis == "private"):
+            continue
         try:
             st = e.stat(follow_symlinks=False)
         except OSError:
             continue
         mtime = datetime.fromtimestamp(st.st_mtime).strftime("%Y-%m-%d %H:%M:%S")
+        access = {"vis": "private" if parent_private else vis, "inherited": parent_private}
         if e.is_dir(follow_symlinks=False):
-            n_items, dsize, partial = dir_stats(e.path)
+            n_items, dsize, partial = dir_stats(e.path, child, show_private, vmap)
             dirs.append({"name": e.name, "rel": child, "is_dir": True, "n_items": n_items,
                          "bytes": dsize, "size": ("\u2265 " if partial else "") + human(dsize),
-                         "kind": "folder", "ext": "", "mtime": mtime, "ts": st.st_mtime})
+                         "kind": "folder", "ext": "", "mtime": mtime, "ts": st.st_mtime, **access})
         elif e.is_file(follow_symlinks=False):
             if not rel and e.name == SELF_NAME:
                 continue
             kind, ext = file_kind(e.name)
             files.append({"name": e.name, "rel": child, "is_dir": False, "n_items": 0,
                           "bytes": st.st_size, "size": human(st.st_size),
-                          "kind": kind, "ext": ext, "mtime": mtime, "ts": st.st_mtime})
+                          "kind": kind, "ext": ext, "mtime": mtime, "ts": st.st_mtime, **access})
     dirs.sort(key=lambda x: x["name"].lower())
     files.sort(key=lambda x: x["ts"], reverse=True)
     return dirs + files
 
 
 def check_password():
-    """Return an error response if the upload password is required and wrong, else None."""
-    if not PROTECT_UPLOAD:
-        return None
+    """Return an error response unless the request carries the right password, else None.
+    Asked for on every upload, new folder, delete and public/private change."""
     ip = client_ip()
     if locked_out(ip):
         return "Too many wrong passwords. Try again later.", 429
-    if not password_ok(request.form.get("password", "")):
+    supplied = request.form.get("password", "")
+    if not supplied:
+        return "Enter the password to continue.", 401
+    if not password_ok(supplied):
         _fails.setdefault(ip, []).append(time.time())
-        return "Wrong upload password.", 403
+        return "Wrong password.", 403
     _fails.pop(ip, None)
     return None
 
 
-# ---------- routes: browse, download, upload, mkdir (there is no delete or rename route) ----------
+def form_vis(parent_rel):
+    """Visibility chosen in an upload / new-folder form. Inside a private folder it is always private."""
+    if effective_vis(parent_rel) == "private":
+        return "private"
+    v = (request.form.get("visibility") or "").strip().lower()
+    return v if v in ("public", "private") else DEFAULT_VISIBILITY
+
+
+# ---------- routes: browse, download, upload, mkdir, delete, visibility, unlock (no rename) ----------
 HEAD = r"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -419,7 +505,28 @@ CSS_BASE = r"""
   .x{width:26px;height:26px;border-radius:6px;border:0;background:none;color:var(--mut);cursor:pointer;font-size:18px;line-height:1}
   .x:hover{background:var(--soft);color:var(--ink)}
 
-  label.f{display:block;margin:16px 0 6px;font-size:13px;font-weight:600}
+  label.f,legend.f{display:block;margin:16px 0 6px;font-size:13px;font-weight:600}
+  .solo{margin:24px auto 48px}
+  /* collapsible side panel (upload / publish) */
+  .grid.collapsed{grid-template-columns:44px minmax(0,1fr)}
+  .grid.collapsed > .side{display:none}
+  .rail{display:none}
+  .grid.collapsed > .rail{display:flex;flex-direction:column;align-items:center;gap:12px;width:44px;padding:14px 0;
+    border:1px solid var(--line);border-radius:10px;background:var(--panel);color:var(--ink);cursor:pointer;font:inherit;font-size:13px;font-weight:650}
+  .rail:hover{border-color:var(--acc);color:var(--acc)}
+  .rail svg{width:18px;height:18px;stroke:currentColor;flex:none}
+  .rail span{writing-mode:vertical-rl}
+  .pclose{display:inline-grid;place-items:center;width:30px;height:30px;padding:0;border:1px solid var(--line);border-radius:8px;
+    background:var(--panel);color:var(--mut);cursor:pointer}
+  .pclose:hover{border-color:var(--acc);color:var(--acc)}
+  .pclose svg{width:16px;height:16px;stroke:currentColor}
+  .side .phead{flex-wrap:nowrap}
+  .side .phead h2{display:block}
+  @media (max-width:880px){
+    .grid.collapsed{grid-template-columns:1fr}
+    .grid.collapsed > .rail{flex-direction:row;width:auto;padding:11px 14px}
+    .rail span{writing-mode:horizontal-tb}
+  }
   .pw{position:relative}
   .pw input{width:100%;height:40px;padding:0 64px 0 12px;border:1px solid var(--line);border-radius:8px;background:var(--panel)}
   .pw input:focus-visible{outline-offset:0}
@@ -557,6 +664,28 @@ CSS_EXTRA = r"""
   .top .who .link{color:#5EEAD4}
   .top .pill.off{background:rgba(255,255,255,.08);border-color:rgba(255,255,255,.2);color:#B7C6D8}
   .top :focus-visible{outline-color:#5EEAD4}
+
+  /* ---- public / private ---- */
+  fieldset.vis{margin:0;padding:0;border:0}
+  fieldset.vis legend{padding:0}
+  .opts{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+  .opt{display:flex;gap:9px;align-items:flex-start;padding:9px 11px;border:1px solid var(--line);border-radius:8px;cursor:pointer;background:var(--panel)}
+  .opt:has(input:checked){border-color:var(--acc);background:var(--acc-soft)}
+  .opt input{margin:3px 0 0;accent-color:var(--acc)}
+  .opt strong{display:block;font-size:13.5px;font-weight:650}
+  .opt .sub{font-size:12px;line-height:1.35}
+  button.pill{border:1px solid transparent;cursor:pointer;font:inherit;font-size:12px;font-weight:600}
+  button.pill:hover{border-color:var(--acc)}
+  .pill.pub{background:var(--ok-bg);color:var(--ok)}
+  .pill.priv{background:var(--soft);color:var(--ink);border-color:var(--line)}
+  .pill svg{width:11px;height:11px;stroke:currentColor;vertical-align:-1px;margin-right:4px}
+  .mini.danger{color:var(--bad)}
+  .mini.danger:hover{border-color:var(--bad);color:var(--bad);background:var(--bad-bg)}
+  .lockbar{display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding:10px 18px;border-bottom:1px solid var(--line);background:var(--soft);font-size:13.5px;color:var(--mut)}
+  .lockbar svg{width:15px;height:15px;stroke:currentColor;flex:none}
+  .lockbar form{margin:0}
+  .lockbar .link{font-size:13.5px}
+  .btn.danger{background:var(--bad);color:#fff}
 """
 
 HEADER = r"""<header class="top"><div class="wrap">
@@ -573,13 +702,9 @@ HEADER = r"""<header class="top"><div class="wrap">
     {% endif %}
   </div>
   <div class="right">
-    {% if user %}
-    <div class="who">Signed in as <strong>{{ user.name }}</strong>{% if user.role == 'admin' and not user.shared %}<span class="pill off">admin</span>{% endif %}
-      <form method="post" action="{{ url_for('logout') }}"><input type="hidden" name="csrf" value="{{ csrf }}"><button class="link" type="submit">Sign out</button></form></div>
-    {% endif %}
-    <div class="lock" title="{{ badge_hint or 'Files can be added and downloaded. They can\u2019t be deleted or overwritten.' }}">
+    <div class="lock" title="Public files and pages are open to everyone. Private ones need the password. Every upload, publish, delete or change asks for the password.">
       <svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/></svg>
-      {{ badge or 'Read-only: upload and download' }}
+      {{ 'Unlocked' if unlocked else 'Public only' }}
     </div>
   </div>
 </div></header>
@@ -589,9 +714,12 @@ PAGE_BODY = r"""</style></head>
 <body>
 <!--HEADER-->
 
-<main class="wrap grid">
-  <section class="panel upload" aria-labelledby="uh">
-    <div class="phead"><h2 id="uh">Upload files</h2><span class="sub">Up to {{ max_mb }} MB per upload</span></div>
+<main class="wrap {{ 'grid collapsed' if unlocked else 'solo' }}">
+  {% if unlocked %}
+  <button type="button" class="rail" id="railbtn" aria-controls="side" aria-expanded="false" title="Show the upload panel"><svg viewBox="0 0 24 24" fill="none" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 6l6 6-6 6"/></svg><span>Upload files</span></button>
+  <section class="panel upload side" id="side" aria-labelledby="uh">
+    <div class="phead"><div><h2 id="uh">Upload files</h2><span class="sub">Up to {{ max_mb }} MB per upload</span></div>
+      <button type="button" class="pclose" id="sideclose" aria-label="Hide the upload panel" title="Hide"><svg viewBox="0 0 24 24" fill="none" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15 6l-6 6 6 6"/></svg></button></div>
     <div class="pbody">
       <p class="dest sub">Uploading to <strong>{{ dest_label }}</strong></p>
       <button type="button" id="zone" class="zone" aria-describedby="zhint">
@@ -609,19 +737,32 @@ PAGE_BODY = r"""</style></head>
         <ul class="queue" id="queue"></ul>
       </div>
 
-      {% if need_pw %}
-      <label class="f" for="pw">Upload password</label>
+      <fieldset class="vis">
+        <legend class="f">Who can see these files</legend>
+        {% if cur_private %}
+        <p class="hint" style="margin:0">This folder is private, so files uploaded here are private too.</p>
+        {% else %}
+        <div class="opts">
+          <label class="opt"><input type="radio" name="upvis" value="private"{% if default_vis == 'private' %} checked{% endif %}>
+            <span><strong>Private</strong><span class="sub">Password needed to see or download</span></span></label>
+          <label class="opt"><input type="radio" name="upvis" value="public"{% if default_vis == 'public' %} checked{% endif %}>
+            <span><strong>Public</strong><span class="sub">Anyone with the link, no password</span></span></label>
+        </div>
+        {% endif %}
+      </fieldset>
+
+      <label class="f" for="pw">Password</label>
       <div class="pw">
         <input id="pw" type="password" autocomplete="off" spellcheck="false">
         <button type="button" id="pwt" aria-pressed="false">Show</button>
       </div>
-      {% endif %}
 
       <div id="err" class="note err" role="alert" hidden></div>
       <button type="button" class="btn" id="go" disabled>Upload files</button>
-      <p class="rule">Uploaded files can’t be deleted or replaced. If a name already exists, the new file is saved with a timestamp added.</p>
+      <p class="rule">Uploading, creating folders, deleting and switching public/private always ask for the password. If a name already exists, the new file is saved with a timestamp added.</p>
     </div>
   </section>
+  {% endif %}
 
   <section class="panel" aria-labelledby="lh">
     <div class="phead">
@@ -630,55 +771,76 @@ PAGE_BODY = r"""</style></head>
         <span class="sub num" id="stats">{{ nd }} folder{{ '' if nd == 1 else 's' }} · {{ nf }} file{{ '' if nf == 1 else 's' }} · {{ total }}</span>
       </div>
       <div class="tools">
-        <button type="button" class="newf" id="newf"><svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>New folder</button>
+        {% if unlocked %}<button type="button" class="newf" id="newf"><svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>New folder</button>{% endif %}
         <div class="search">
           <svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="M20 20l-3.5-3.5"/></svg>
           <input id="q" type="search" placeholder="Filter this folder" aria-label="Filter this folder by name">
         </div>
       </div>
     </div>
+<!--LOCKBAR-->
     {% with m = get_flashed_messages() %}{% if m %}<div class="flash">{% for x in m %}<p class="note ok" role="status">{{ x }}</p>{% endfor %}</div>{% endif %}{% endwith %}
     <div class="scroll"><table>
       <thead><tr>
         <th scope="col" aria-sort="none"><button type="button" data-key="name">Name</button></th>
         <th scope="col" class="r" aria-sort="none"><button type="button" data-key="size">Size</button></th>
         <th scope="col" class="hide-sm" aria-sort="descending"><button type="button" data-key="ts">Modified</button></th>
-        <th scope="col" class="r"><span class="sr" style="position:absolute;left:-9999px">Download</span></th>
+        {% if unlocked %}<th scope="col">Access</th>{% endif %}
+        <th scope="col" class="r"><span class="sr">Actions</span></th>
       </tr></thead>
       <tbody id="rows">
         {% for f in entries %}
-        <tr data-name="{{ f.name|lower }}" data-dir="{{ 1 if f.is_dir else 0 }}" data-size="{{ f.bytes }}" data-ts="{{ f.ts }}">
+        <tr data-name="{{ f.name|lower }}" data-label="{{ f.name }}" data-rel="{{ f.rel }}" data-dir="{{ 1 if f.is_dir else 0 }}" data-items="{{ f.n_items }}" data-vis="{{ f.vis }}" data-size="{{ f.bytes }}" data-ts="{{ f.ts }}">
           {% if f.is_dir %}
           <td><div class="file"><span class="badge" data-k="folder" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg></span><div><a class="fname" href="{{ url_for('browse', p=f.rel) }}">{{ f.name }}</a><div class="sub">{{ f.n_items }} item{{ '' if f.n_items == 1 else 's' }}</div></div></div></td>
-          <td class="r num">{{ f.size }}</td>
-          <td class="hide-sm num">{{ f.mtime }}</td>
-          <td class="r"><a class="dl" href="{{ url_for('browse', p=f.rel) }}" aria-label="Open folder {{ f.name }}">Open</a></td>
           {% else %}
           <td><div class="file"><span class="badge" data-k="{{ f.kind }}" aria-hidden="true">{{ f.ext }}</span><span class="fname">{{ f.name }}</span></div></td>
+          {% endif %}
           <td class="r num">{{ f.size }}</td>
           <td class="hide-sm num">{{ f.mtime }}</td>
-          <td class="r"><a class="dl" href="{{ url_for('download', filepath=f.rel) }}" aria-label="Download {{ f.name }}">
-            <svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 4v11M7.5 10.5L12 15l4.5-4.5M5 20h14"/></svg>Download</a></td>
-          {% endif %}
+          {% if unlocked %}<td>{% if f.inherited %}<span class="pill priv" title="Inside a private folder">{{ lock_svg|safe }}Private</span>
+              {% elif f.vis == 'private' %}<button type="button" class="pill priv" data-act="vis" title="Make public" aria-label="{{ f.name }} is private. Make it public">{{ lock_svg|safe }}Private</button>
+              {% else %}<button type="button" class="pill pub" data-act="vis" title="Make private" aria-label="{{ f.name }} is public. Make it private">Public</button>{% endif %}</td>{% endif %}
+          <td class="r"><div class="act">
+            {% if f.is_dir %}
+            <a class="dl" href="{{ url_for('browse', p=f.rel) }}" aria-label="Open folder {{ f.name }}">Open</a>
+            {% else %}
+            <a class="dl" href="{{ url_for('download', filepath=f.rel) }}" aria-label="Download {{ f.name }}">
+              <svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 4v11M7.5 10.5L12 15l4.5-4.5M5 20h14"/></svg>Download</a>
+            {% endif %}
+            {% if unlocked %}<button type="button" class="mini danger" data-act="del" aria-label="Delete {{ f.name }}">Delete</button>{% endif %}
+          </div></td>
         </tr>
         {% endfor %}
-        <tr class="empty" id="empty" {% if entries %}hidden{% endif %}><td colspan="4" id="emptytxt">{{ 'This folder is empty.' if cur else 'Nothing here yet.' }} Drop files into the upload panel or create a folder.</td></tr>
+        <tr class="empty" id="empty" {% if entries %}hidden{% endif %}><td colspan="{{ 5 if unlocked else 4 }}" id="emptytxt">{% if unlocked %}{{ 'This folder is empty.' if cur else 'Nothing here yet.' }} Drop files into the upload panel or create a folder.{% else %}{{ 'No public files in this folder.' if cur else 'No public files yet.' }}{% endif %}</td></tr>
       </tbody>
     </table></div>
   </section>
 </main>
 
+{% if unlocked %}
 <dialog id="mk" aria-labelledby="mkh">
   <form id="mkform" novalidate>
     <h2 id="mkh">New folder</h2>
-    <p class="sub">It will be created in <strong>{{ dest_label }}</strong>. Folders can’t be renamed or deleted afterwards.</p>
+    <p class="sub">It will be created in <strong>{{ dest_label }}</strong>. Folders can’t be renamed afterwards.</p>
     <label class="f" for="mkname">Folder name</label>
     <input id="mkname" type="text" maxlength="100" autocomplete="off" spellcheck="false">
     <p class="sub" style="margin:6px 0 0">Letters, numbers, dashes, underscores and dots. Spaces become underscores.</p>
-    {% if need_pw %}
-    <label class="f" for="mkpw">Upload password</label>
+    <fieldset class="vis">
+      <legend class="f">Who can see this folder</legend>
+      {% if cur_private %}
+      <p class="hint" style="margin:0">Private, like the folder it’s in.</p>
+      {% else %}
+      <div class="opts">
+        <label class="opt"><input type="radio" name="mkvis" value="private"{% if default_vis == 'private' %} checked{% endif %}>
+          <span><strong>Private</strong><span class="sub">It and everything in it need the password</span></span></label>
+        <label class="opt"><input type="radio" name="mkvis" value="public"{% if default_vis == 'public' %} checked{% endif %}>
+          <span><strong>Public</strong><span class="sub">Anyone can open it</span></span></label>
+      </div>
+      {% endif %}
+    </fieldset>
+    <label class="f" for="mkpw">Password</label>
     <input id="mkpw" type="password" autocomplete="off" spellcheck="false">
-    {% endif %}
     <div id="mkerr" class="note err" role="alert" hidden></div>
     <div class="row">
       <button type="button" class="btn ghost" id="mkcancel">Cancel</button>
@@ -687,10 +849,72 @@ PAGE_BODY = r"""</style></head>
   </form>
 </dialog>
 
+<dialog id="ad" aria-labelledby="adh">
+  <form id="adform" novalidate>
+    <h2 id="adh"></h2>
+    <p class="sub" id="adtxt"></p>
+    <label class="f" for="adpw">Password</label>
+    <input id="adpw" type="password" autocomplete="off" spellcheck="false">
+    <div id="aderr" class="note err" role="alert" hidden></div>
+    <div class="row">
+      <button type="button" class="btn ghost" id="adcancel">Cancel</button>
+      <button type="submit" class="btn" id="adgo"></button>
+    </div>
+  </form>
+</dialog>
+{% endif %}
+
 <script>
+/* collapsible side panel: hidden by default, remembered per browser */
+(function(){
+  var g=document.querySelector('main.grid'), rail=document.getElementById('railbtn'), close=document.getElementById('sideclose');
+  if(!g||!rail||!close)return;
+  var KEY='filenest-side-'+(location.pathname.indexOf('/pages')===0?'pages':'files');
+  function set(open,focus,save){
+    g.classList.toggle('collapsed',!open); rail.setAttribute('aria-expanded',open?'true':'false');
+    if(save){try{localStorage.setItem(KEY,open?'open':'closed')}catch(e){}}
+    if(focus){(open?close:rail).focus()}
+  }
+  var saved=null; try{saved=localStorage.getItem(KEY)}catch(e){}
+  if(g.dataset.force==='open'||saved==='open')set(true,false,false);
+  rail.onclick=function(){set(true,true,true)};
+  close.onclick=function(){set(false,true,true)};
+  document.addEventListener('dragenter',function(e){
+    var t=e.dataTransfer&&e.dataTransfer.types;
+    if(t&&Array.prototype.indexOf.call(t,'Files')!==-1&&g.classList.contains('collapsed')&&document.getElementById('zone'))set(true,false,false);
+  });
+})();
 (function(){
   var $ = function(id){return document.getElementById(id)};
-  var CUR = {{ cur|tojson }}, MAX = {{ max_mb }} * 1048576, NEED_PW = {{ 'true' if need_pw else 'false' }};
+  var CUR = {{ cur|tojson }}, MAX = {{ max_mb }} * 1048576;
+  function picked(name){var r=document.querySelector('input[name="'+name+'"]:checked');return r?r.value:''}
+
+  /* list: search + sort */
+  var tbody=$('rows'), empty=$('empty'), q=$('q'), stats=$('stats'), key='ts', dir=-1;
+  function rows(){return Array.prototype.slice.call(tbody.querySelectorAll('tr[data-name]'))}
+  function filter(){
+    var term=q.value.trim().toLowerCase(), shown=0, all=rows();
+    all.forEach(function(r){var ok=!term||r.dataset.name.indexOf(term)!==-1;r.hidden=!ok;if(ok)shown++});
+    if(!all.length){empty.hidden=false}
+    else{empty.hidden=shown>0; $('emptytxt').textContent='No files match \u201c'+q.value.trim()+'\u201d.'}
+  }
+  q.addEventListener('input',filter);
+  Array.prototype.forEach.call(document.querySelectorAll('th button[data-key]'),function(b){
+    b.onclick=function(){
+      var k=b.dataset.key; dir=(key===k)?-dir:(k==='name'?1:-1); key=k;
+      rows().sort(function(a,c){
+        if(a.dataset.dir!==c.dataset.dir) return a.dataset.dir==='1'?-1:1;
+        var x=a.dataset[k], y=c.dataset[k];
+        if(k!=='name'){x=parseFloat(x);y=parseFloat(y);return (x-y)*dir}
+        return x.localeCompare(y)*dir;
+      }).forEach(function(r){tbody.insertBefore(r,empty)});
+      Array.prototype.forEach.call(document.querySelectorAll('th[aria-sort]'),function(th){th.setAttribute('aria-sort','none')});
+      b.parentNode.setAttribute('aria-sort',dir===1?'ascending':'descending');
+    };
+  });
+
+  if(!{{ 'true' if unlocked else 'false' }}) return;   /* upload and edit controls exist only after unlock */
+
   var zone=$('zone'), fileIn=$('file'), fill=$('fill'), zin=$('zin'), go=$('go'), err=$('err'),
       qwrap=$('qwrap'), queueEl=$('queue'), qsum=$('qsum'), pw=$('pw'), busy=false, queue=[];
 
@@ -732,13 +956,11 @@ PAGE_BODY = r"""</style></head>
   ['dragleave','drop'].forEach(function(e){document.addEventListener(e,function(ev){if(ev.type==='dragleave'&&zone.contains(ev.relatedTarget))return;zone.classList.remove('over')})});
   document.addEventListener('drop',function(ev){ev.preventDefault();if(!busy&&ev.dataTransfer&&ev.dataTransfer.files.length)add(ev.dataTransfer.files)});
 
-  if(pw){
-    $('pwt').onclick=function(){
-      var show=pw.type==='password'; pw.type=show?'text':'password';
-      this.textContent=show?'Hide':'Show'; this.setAttribute('aria-pressed',show);
-    };
-    pw.addEventListener('keydown',function(e){if(e.key==='Enter'&&!go.disabled)go.click()});
-  }
+  $('pwt').onclick=function(){
+    var show=pw.type==='password'; pw.type=show?'text':'password';
+    this.textContent=show?'Hide':'Show'; this.setAttribute('aria-pressed',show);
+  };
+  pw.addEventListener('keydown',function(e){if(e.key==='Enter'&&!go.disabled)go.click()});
 
   function setBusy(b){
     busy=b; zone.classList.toggle('busy',b); zone.disabled=b; go.disabled=b||!queue.length;
@@ -747,10 +969,10 @@ PAGE_BODY = r"""</style></head>
   var idle=zin.innerHTML;
 
   go.onclick=function(){
-    if(NEED_PW && !pw.value){showErr('Enter the upload password to continue.');pw.focus();return}
+    if(!pw.value){showErr('Enter the password to upload.');pw.focus();return}
     showErr('');
     var fd=new FormData(); queue.forEach(function(f){fd.append('files',f)}); fd.append('path',CUR);
-    if(NEED_PW) fd.append('password',pw.value);
+    fd.append('visibility',picked('upvis')); fd.append('password',pw.value);
     var x=new XMLHttpRequest(), t0=Date.now();
     x.open('POST','{{ url_for("upload") }}');
     setBusy(true);
@@ -766,43 +988,19 @@ PAGE_BODY = r"""</style></head>
       if(x.status>=200 && x.status<400){location.reload();return}
       setBusy(false); render();
       showErr(x.responseText || 'The upload failed. Try again.');
-      if(NEED_PW && (x.status===403)){pw.select()}
+      if(x.status===401||x.status===403){pw.select()}
     };
     x.onerror=function(){setBusy(false);render();showErr('The connection dropped before the upload finished. Check your network and try again.')};
     x.send(fd);
   };
 
-  /* list: search + sort */
-  var tbody=$('rows'), empty=$('empty'), q=$('q'), stats=$('stats'), key='ts', dir=-1;
-  function rows(){return Array.prototype.slice.call(tbody.querySelectorAll('tr[data-name]'))}
-  function filter(){
-    var term=q.value.trim().toLowerCase(), shown=0, all=rows();
-    all.forEach(function(r){var ok=!term||r.dataset.name.indexOf(term)!==-1;r.hidden=!ok;if(ok)shown++});
-    if(!all.length){empty.hidden=false}
-    else{empty.hidden=shown>0; $('emptytxt').textContent='No files match \u201c'+q.value.trim()+'\u201d.'}
-  }
-  q.addEventListener('input',filter);
-  Array.prototype.forEach.call(document.querySelectorAll('th button[data-key]'),function(b){
-    b.onclick=function(){
-      var k=b.dataset.key; dir=(key===k)?-dir:(k==='name'?1:-1); key=k;
-      rows().sort(function(a,c){
-        if(a.dataset.dir!==c.dataset.dir) return a.dataset.dir==='1'?-1:1;
-        var x=a.dataset[k], y=c.dataset[k];
-        if(k!=='name'){x=parseFloat(x);y=parseFloat(y);return (x-y)*dir}
-        return x.localeCompare(y)*dir;
-      }).forEach(function(r){tbody.insertBefore(r,empty)});
-      Array.prototype.forEach.call(document.querySelectorAll('th[aria-sort]'),function(th){th.setAttribute('aria-sort','none')});
-      b.parentNode.setAttribute('aria-sort',dir===1?'ascending':'descending');
-    };
-  });
   render();
 
   /* new folder dialog */
   var mk=$('mk'), mkname=$('mkname'), mkpw=$('mkpw'), mkerr=$('mkerr'), mkgo=$('mkgo');
   function mkFail(t){mkerr.textContent=t;mkerr.hidden=false;mkgo.disabled=false}
   $('newf').onclick=function(){
-    mkerr.hidden=true; mkname.value=''; mkgo.disabled=false;
-    if(mkpw&&pw) mkpw.value=pw.value;
+    mkerr.hidden=true; mkname.value=''; mkpw.value=''; mkgo.disabled=false;
     mk.showModal(); mkname.focus();
   };
   $('mkcancel').onclick=function(){mk.close()};
@@ -810,41 +1008,144 @@ PAGE_BODY = r"""</style></head>
     ev.preventDefault();
     var name=mkname.value.trim();
     if(!name){mkFail('Enter a name for the folder.');mkname.focus();return}
-    if(NEED_PW && !mkpw.value){mkFail('Enter the upload password to continue.');mkpw.focus();return}
+    if(!mkpw.value){mkFail('Enter the password to create a folder.');mkpw.focus();return}
     var fd=new FormData(); fd.append('path',CUR); fd.append('name',name);
-    if(NEED_PW) fd.append('password',mkpw.value);
+    fd.append('visibility',picked('mkvis')); fd.append('password',mkpw.value);
     mkerr.hidden=true; mkgo.disabled=true;
-    fetch('{{ url_for("mkdir") }}',{method:'POST',body:fd,credentials:'same-origin'})
-      .then(function(r){return r.text().then(function(t){return {ok:r.ok,t:t}})})
-      .then(function(res){if(res.ok){location.reload()}else{mkFail(res.t||'The folder could not be created.')}})
-      .catch(function(){mkFail('The connection dropped. Check your network and try again.')});
+    post('{{ url_for("mkdir") }}',fd,mkFail,'The folder could not be created.');
   };
+
+  function post(url,fd,fail,fallback){
+    fetch(url,{method:'POST',body:fd,credentials:'same-origin'})
+      .then(function(r){return r.text().then(function(t){return {ok:r.ok,t:t}})})
+      .then(function(res){if(res.ok){location.reload()}else{fail(res.t||fallback)}})
+      .catch(function(){fail('The connection dropped. Check your network and try again.')});
+  }
+
+  /* delete + public/private: every action asks for the password */
+  var ad=$('ad'), adpw=$('adpw'), aderr=$('aderr'), adgo=$('adgo'), act=null;
+  function adFail(t){aderr.textContent=t;aderr.hidden=false;adgo.disabled=false;adpw.select()}
+  function ask(o){
+    act=o; $('adh').textContent=o.title; $('adtxt').textContent=o.text;
+    adgo.textContent=o.btn; adgo.className='btn'+(o.danger?' danger':'');
+    aderr.hidden=true; adpw.value=''; adgo.disabled=false;
+    ad.showModal(); adpw.focus();
+  }
+  $('adcancel').onclick=function(){ad.close()};
+  $('adform').onsubmit=function(ev){
+    ev.preventDefault();
+    if(!adpw.value){adFail('Enter the password to continue.');return}
+    var fd=new FormData(); Object.keys(act.fields).forEach(function(k){fd.append(k,act.fields[k])});
+    fd.append('password',adpw.value);
+    aderr.hidden=true; adgo.disabled=true;
+    post(act.url,fd,adFail,'That didn’t work. Try again.');
+  };
+  tbody.addEventListener('click',function(e){
+    var b=e.target.closest('[data-act]'); if(!b)return;
+    var tr=b.closest('tr'), d=tr.dataset, isDir=d.dir==='1', name=d.label;
+    if(b.dataset.act==='del'){
+      var n=parseInt(d.items,10)||0;
+      ask({title:'Delete '+(isDir?'folder':'file')+'?', btn:'Delete', danger:true,
+           url:'{{ url_for("delete") }}', fields:{path:d.rel},
+           text:'“'+name+'” will be removed permanently'+
+                (isDir?(n?' together with everything inside it ('+n+' item'+(n===1?'':'s')+' at the top level, plus anything you can’t see).':' together with anything inside it.'):'.')+
+                ' This can’t be undone.'});
+    }else{
+      var toPub=d.vis==='private';
+      ask({title:'Make “'+name+'” '+(toPub?'public':'private')+'?', btn:toPub?'Make public':'Make private',
+           url:'{{ url_for("set_visibility") }}', fields:{path:d.rel, visibility:toPub?'public':'private'},
+           text: toPub ? ('Anyone who can reach this site will be able to see'+(isDir?' this folder and download the public files in it':' and download it')+' without a password.')
+                       : ('Only people who unlock private files with the password will see'+(isDir?' this folder or anything in it.':' or download it.'))});
+    }
+  });
 })();
 </script>
 </body></html>
 """
 
-PAGE = (HEAD + "/*CSS*/" + PAGE_BODY).replace("/*CSS*/", CSS_BASE + CSS_EXTRA).replace("<!--HEADER-->", HEADER)
+LOCKBAR = r"""    <div class="lockbar">
+      <svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">{% if unlocked %}<rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V8a4 4 0 0 1 7.5-2"/>{% else %}<rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/>{% endif %}</svg>
+      {% if unlocked %}
+        <span>Private {{ what }} are unlocked and shown in this list.</span>
+        <form method="post" action="{{ url_for('lock') }}"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="next" value="{{ request.path }}"><button class="link" type="submit">Lock</button></form>
+      {% else %}
+        <span>You’re seeing public {{ what }} only. Unlock to see private {{ what }} and to {{ 'upload or make changes' if what == 'files' else 'publish or make changes' }}.</span>
+        <a class="link" href="{{ url_for('unlock', next=request.path) }}">Unlock with password</a>
+      {% endif %}
+    </div>
+"""
+
+PAGE = (HEAD + "/*CSS*/" + PAGE_BODY).replace("/*CSS*/", CSS_BASE + CSS_EXTRA).replace("<!--HEADER-->", HEADER).replace("<!--LOCKBAR-->", LOCKBAR)
+
+
+@app.context_processor
+def common_context():
+    """Values every template uses (header, unlock bar)."""
+    return {"unlocked": files_unlocked(), "csrf": csrf_token(), "pages_on": PAGES_ENABLED,
+            "title": APP_TITLE, "max_w": PAGE_MAX_WIDTH, "lock_svg": LOCK_SVG, "auth_user": AUTH_USER}
+
+
+LOCK_SVG = ('<svg viewBox="0 0 24 24" fill="none" stroke-width="2.4" stroke-linecap="round" '
+            'stroke-linejoin="round" aria-hidden="true"><rect x="5" y="11" width="14" height="9" rx="2"/>'
+            '<path d="M8 11V8a4 4 0 0 1 8 0v3"/></svg>')
 
 
 @app.get("/", defaults={"p": ""})
 @app.get("/tree/<path:p>")
 def browse(p):
     rel, full = resolve_dir(p)
-    entries = list_dir(full, rel)
+    unlocked = files_unlocked()
+    if not unlocked and effective_vis(rel) == "private":
+        return redirect(url_for("unlock", next=request.path))
+    entries = list_dir(full, rel, show_private=unlocked)
     crumbs, acc = [{"name": "Home", "rel": ""}], []
     for seg in (rel.split("/") if rel else []):
         acc.append(seg)
         crumbs.append({"name": seg, "rel": "/".join(acc)})
     nd = sum(1 for e in entries if e["is_dir"])
     nf = len(entries) - nd
-    user = current_user() if PAGES_ENABLED else None
     return render_template_string(
-        PAGE, user=user, csrf=csrf_token() if user else "", pages_on=PAGES_ENABLED, nav="files",
+        PAGE, nav="files", what="files",
         entries=entries, cur=rel, crumbs=crumbs, nd=nd, nf=nf,
         dest_label=" / ".join(c["name"] for c in crumbs),
         total=human(sum(e["bytes"] for e in entries)),
-        need_pw=PROTECT_UPLOAD, title=APP_TITLE, max_mb=MAX_UPLOAD_MB, max_w=PAGE_MAX_WIDTH)
+        cur_private=effective_vis(rel) == "private", default_vis=DEFAULT_VISIBILITY,
+        max_mb=MAX_UPLOAD_MB)
+
+
+@app.route("/unlock", methods=["GET", "POST"])
+def unlock():
+    """Password-only prompt (no username) that reveals private files and pages in this
+    browser for SESSION_HOURS."""
+    nxt = safe_next(request.values.get("next", "")) or url_for("browse", p="")
+    if files_unlocked():
+        return redirect(nxt)
+    error, status = "", 200
+    if request.method == "POST":
+        ip = "unlock:" + client_ip()
+        if not csrf_ok():
+            error, status = "Your session expired. Please try again.", 400
+        elif locked_out(ip):
+            error, status = "Too many wrong passwords. Try again in a few minutes.", 429
+        elif password_ok(request.form.get("password", "")):
+            _fails.pop(ip, None)
+            session.permanent = True
+            session["files_ok"] = _unlock_tag()
+            return redirect(nxt)
+        else:
+            _fails.setdefault(ip, []).append(time.time())
+            error, status = "Wrong password.", 401
+    return render_template_string(
+        UNLOCK_TMPL, error=error, nxt=nxt, nav="pages" if nxt.startswith(PAGE_PREFIXES) else "files",
+        ptitle=f"Unlock \u00b7 {APP_TITLE}", hours=f"{SESSION_HOURS:g}"), status
+
+
+@app.post("/lock")
+def lock():
+    if csrf_ok():
+        session.pop("files_ok", None)
+        flash("Private files and pages are locked again.")
+    return redirect(safe_next(request.form.get("next", "")) or url_for("browse", p=""))
 
 
 @app.post("/upload")
@@ -853,6 +1154,7 @@ def upload():
     if bad:
         return bad
     rel, full = resolve_dir(request.form.get("path", ""))
+    vis = form_vis(rel)
     saved, skipped = [], []
     for f in request.files.getlist("files"):
         name = secure_filename(f.filename or "")
@@ -860,12 +1162,14 @@ def upload():
             skipped.append(f.filename or "(empty)")
             continue
         path = unique_path(full, name)
+        stored = os.path.basename(path)
+        set_vis(f"{rel}/{stored}" if rel else stored, vis)   # record first: never briefly public
         f.save(path)
         os.chmod(path, 0o644)
-        saved.append(os.path.basename(path))
+        saved.append(stored)
     where = f" to {rel}" if rel else ""
     if saved:
-        flash(f"Uploaded{where}: {', '.join(saved)}")
+        flash(f"Uploaded{where} as {vis}: {', '.join(saved)}")
     if skipped:
         flash(f"Skipped invalid names: {', '.join(skipped)}")
     return redirect(url_for("browse", p=rel))
@@ -884,27 +1188,82 @@ def mkdir():
     depth = (rel.count("/") + 1 if rel else 0) + 1
     if depth > MAX_FOLDER_DEPTH:
         return f"Folders can be nested up to {MAX_FOLDER_DEPTH} levels deep.", 400
+    child = f"{rel}/{name}" if rel else name
+    target = os.path.join(full, name)
+    if os.path.lexists(target):
+        return f"\u201c{name}\u201d already exists in this folder.", 409
+    vis = form_vis(rel)
+    set_vis(child, vis)                       # record first: never briefly public
     try:
-        os.mkdir(os.path.join(full, name), 0o750)
+        os.mkdir(target, 0o750)
     except FileExistsError:
         return f"\u201c{name}\u201d already exists in this folder.", 409
     except OSError as e:
+        forget_vis(child)
         return f"Could not create the folder ({e.strerror}).", 500
-    flash(f"Created folder {name}" + (f" (name adjusted from \u201c{raw}\u201d)" if name != raw else ""))
+    flash(f"Created {vis} folder {name}" + (f" (name adjusted from \u201c{raw}\u201d)" if name != raw else ""))
     return "", 204
 
 
-@app.get("/download/<path:filepath>")
-def download(filepath):
-    rel = clean_rel(filepath)
+def resolve_item(rel_raw):
+    """(clean relative path, parent abs dir, name, abs path) of an existing file or folder, else 404."""
+    rel = clean_rel(rel_raw)
     parent, name = os.path.split(rel)
     if not name or (not parent and name == SELF_NAME):
         abort(404)
     _, full = resolve_dir(parent)
     target = os.path.join(full, name)
-    if os.path.islink(target) or not os.path.isfile(target):
+    if os.path.islink(target) or not os.path.exists(target):
         abort(404)
-    return send_from_directory(full, name, as_attachment=True)
+    return rel, full, name, target
+
+
+@app.post("/delete")
+def delete():
+    bad = check_password()
+    if bad:
+        return bad
+    rel, _, name, target = resolve_item(request.form.get("path", ""))
+    try:
+        if os.path.isdir(target):
+            shutil.rmtree(target)             # does not follow symlinks inside the folder
+        else:
+            os.remove(target)
+    except OSError as e:
+        return f"Could not delete \u201c{name}\u201d ({e.strerror}).", 500
+    forget_vis(rel)
+    flash(f"Deleted {name}")
+    return "", 204
+
+
+@app.post("/visibility")
+def set_visibility():
+    bad = check_password()
+    if bad:
+        return bad
+    rel, _, name, _ = resolve_item(request.form.get("path", ""))
+    vis = (request.form.get("visibility") or "").strip().lower()
+    if vis not in ("public", "private"):
+        return "Choose public or private.", 400
+    parent = os.path.dirname(rel)
+    if vis == "public" and effective_vis(parent) == "private":
+        return "This item is inside a private folder. Make the folder public first.", 400
+    set_vis(rel, vis)
+    flash(f"{name} is now {vis}")
+    return "", 204
+
+
+@app.get("/download/<path:filepath>")
+def download(filepath):
+    rel, full, name, target = resolve_item(filepath)
+    if not os.path.isfile(target):
+        abort(404)
+    if not can_see(rel):
+        return redirect(url_for("unlock", next=request.path))
+    resp = send_from_directory(full, name, as_attachment=True)
+    if effective_vis(rel) == "private":
+        resp.headers["Cache-Control"] = "private, no-store"
+    return resp
 
 
 # ---------- templates for sign-in, pages and messages (share CSS + header with the file page) ----------
@@ -912,36 +1271,9 @@ _TOP = HEAD + "/*CSS*/</style></head>\n<body>\n<!--HEADER-->\n"
 
 
 def _build(t):
-    return t.replace("/*CSS*/", CSS_BASE + CSS_EXTRA).replace("<!--HEADER-->", HEADER)
+    return (t.replace("/*CSS*/", CSS_BASE + CSS_EXTRA).replace("<!--HEADER-->", HEADER)
+             .replace("<!--LOCKBAR-->", LOCKBAR))
 
-
-LOGIN_TMPL = _build(_TOP + r"""
-<main class="wrap">
-  <section class="panel login" aria-labelledby="lh">
-    <div class="phead"><h2 id="lh">Sign in</h2><span class="sub">to view and publish pages</span></div>
-    <div class="pbody">
-    {% if not configured %}
-      <p class="note err" role="alert" style="margin:0">No user accounts exist yet.</p>
-      <p class="sub" style="margin:14px 0 0">An administrator creates accounts on the server:</p>
-      <pre class="code">python3 manage_users.py add yourname --role admin</pre>
-    {% else %}
-      <form method="post" action="{{ url_for('login') }}">
-        <input type="hidden" name="csrf" value="{{ csrf }}">
-        <input type="hidden" name="next" value="{{ nxt }}">
-        <label class="f" for="u" style="margin-top:0">{{ 'Your name' if shared else 'Username' }}</label>
-        <input class="fld" id="u" name="username" type="text" autocomplete="{{ 'name' if shared else 'username' }}" autocapitalize="none" spellcheck="false" required autofocus maxlength="32" value="{{ username }}">
-        {% if shared %}<p class="hint">Shown as “Uploaded by” on the pages you publish.</p>{% endif %}
-        <label class="f" for="p">Password</label>
-        <input class="fld" id="p" name="password" type="password" autocomplete="current-password" required>
-        {% if error %}<div class="note err" role="alert">{{ error }}</div>{% endif %}
-        <button class="btn" type="submit">Sign in</button>
-      </form>
-    {% endif %}
-    </div>
-  </section>
-</main>
-</body></html>
-""")
 
 MSG_TMPL = _build(_TOP + r"""
 <main class="wrap">
@@ -949,7 +1281,29 @@ MSG_TMPL = _build(_TOP + r"""
     <div class="phead"><h2 id="lh">{{ heading }}</h2></div>
     <div class="pbody">
       <p style="margin:0 0 16px">{{ text }}</p>
-      <a class="dl" href="{{ url_for('pages') }}">Back to pages</a>
+      <a class="dl" href="{{ url_for('pages') }}">Back to pages</a>{% if not unlocked %} <a class="dl" href="{{ url_for('unlock', next=request.path) }}">Unlock with password</a>{% endif %}
+    </div>
+  </section>
+</main>
+</body></html>
+""")
+
+UNLOCK_TMPL = _build(_TOP + r"""
+<main class="wrap">
+  <section class="panel login" aria-labelledby="lh">
+    <div class="phead"><h2 id="lh">Unlock private files and pages</h2></div>
+    <div class="pbody">
+      <p class="sub" style="margin:0 0 4px">Private files, folders and pages need the password to see or open.
+        This browser stays unlocked for {{ hours }} hours or until you lock it.</p>
+      <form method="post" action="{{ url_for('unlock') }}">
+        <input type="hidden" name="csrf" value="{{ csrf }}">
+        <input type="hidden" name="next" value="{{ nxt }}">
+        <label class="f" for="p">Password</label>
+        <input class="fld" id="p" name="password" type="password" autocomplete="current-password" required autofocus>
+        {% if error %}<div class="note err" role="alert">{{ error }}</div>{% endif %}
+        <button class="btn" type="submit">Unlock</button>
+      </form>
+      <p class="rule"><a class="link" href="{{ url_for('pages') if nav == 'pages' else url_for('browse', p='') }}">Back to public {{ 'pages' if nav == 'pages' else 'files' }}</a></p>
     </div>
   </section>
 </main>
@@ -957,14 +1311,15 @@ MSG_TMPL = _build(_TOP + r"""
 """)
 
 PAGES_TMPL = _build(_TOP + r"""
-<main class="wrap grid">
-  <section class="panel upload" aria-labelledby="ph">
-    <div class="phead"><h2 id="ph">Publish a page</h2><span class="sub">Up to {{ page_mb }} MB</span></div>
+<main class="wrap {{ ('grid' ~ ('' if errors else ' collapsed')) if unlocked else 'solo' }}"{% if errors %} data-force="open"{% endif %}>
+  {% if unlocked %}
+  <button type="button" class="rail" id="railbtn" aria-controls="side" aria-expanded="{{ 'true' if errors else 'false' }}" title="Show the publish panel"><svg viewBox="0 0 24 24" fill="none" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 6l6 6-6 6"/></svg><span>Publish a page</span></button>
+  <section class="panel upload side" id="side" aria-labelledby="ph">
+    <div class="phead"><div><h2 id="ph">Publish a page</h2><span class="sub">Up to {{ page_mb }} MB</span></div>
+      <button type="button" class="pclose" id="sideclose" aria-label="Hide the publish panel" title="Hide"><svg viewBox="0 0 24 24" fill="none" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15 6l-6 6 6 6"/></svg></button></div>
     <div class="pbody">
       {% if errors.form %}<div class="note err" role="alert" style="margin:0 0 14px">{{ errors.form }}</div>{% endif %}
       <form method="post" action="{{ url_for('publish') }}" enctype="multipart/form-data" id="pf">
-        <input type="hidden" name="csrf" value="{{ csrf }}">
-
         <label class="f" for="title" style="margin-top:0">Title <span class="req" aria-hidden="true">*</span></label>
         <input class="fld" id="title" name="title" type="text" required maxlength="120" autocomplete="off" value="{{ form.title }}"{% if errors.title %} aria-invalid="true" aria-describedby="e-title"{% endif %}>
         {% if errors.title %}<p class="ferr" id="e-title">{{ errors.title }}</p>{% endif %}
@@ -974,39 +1329,41 @@ PAGES_TMPL = _build(_TOP + r"""
         <datalist id="cats">{% for c, n in cats %}<option value="{{ c }}">{% endfor %}</datalist>
         {% if errors.category %}<p class="ferr" id="e-cat">{{ errors.category }}</p>{% endif %}
 
-        {% if not shared %}
-        <label class="f" for="viewers">Who can view</label>
-        <input class="fld" id="viewers" name="viewers" type="text" autocomplete="off" spellcheck="false" placeholder="Everyone signed in" value="{{ form.viewers }}"{% if errors.viewers %} aria-invalid="true" aria-describedby="e-view"{% endif %}>
-        {% if errors.viewers %}<p class="ferr" id="e-view">{{ errors.viewers }}</p>{% endif %}
-        <p class="hint">Leave empty for everyone signed in, or list usernames and <code>@groups</code> separated by commas, for example <code>alice, @ops</code>.{% if groups %} Groups: {% for g in groups %}@{{ g }}{{ ', ' if not loop.last }}{% endfor %}.{% endif %} You and admins can always open it.</p>
-        {% endif %}
+        <fieldset class="vis">
+          <legend class="f">Who can view</legend>
+          <div class="opts">
+            <label class="opt"><input type="radio" name="visibility" value="private"{% if form.visibility == 'private' %} checked{% endif %}>
+              <span><strong>Private</strong><span class="sub">Password needed to open</span></span></label>
+            <label class="opt"><input type="radio" name="visibility" value="public"{% if form.visibility == 'public' %} checked{% endif %}>
+              <span><strong>Public</strong><span class="sub">Anyone with the link, no password</span></span></label>
+          </div>
+        </fieldset>
 
         <label class="f" for="file">HTML file <span class="req" aria-hidden="true">*</span></label>
         <input class="fld" id="file" name="file" type="file" accept=".html,.htm,text/html" required{% if errors.file %} aria-invalid="true" aria-describedby="e-file"{% endif %}>
         {% if errors.file %}<p class="ferr" id="e-file">{{ errors.file }}</p>{% endif %}
         <p class="ferr" id="e-size" hidden></p>
 
-        {% if need_pw %}
-        <label class="f" for="pw">Upload password <span class="req" aria-hidden="true">*</span></label>
+        <label class="f" for="pw">Password <span class="req" aria-hidden="true">*</span></label>
         <input class="fld" id="pw" name="password" type="password" required autocomplete="off"{% if errors.password %} aria-invalid="true" aria-describedby="e-pw"{% endif %}>
         {% if errors.password %}<p class="ferr" id="e-pw">{{ errors.password }}</p>{% endif %}
-        <p class="hint">The same password used to upload files.</p>
-        {% endif %}
 
         <button class="btn" type="submit" id="pub">Publish</button>
       </form>
-      <p class="rule">Use one self-contained .html file with its CSS, scripts and images inline. Published pages can’t be replaced or deleted. Publish a new page to change one, and {{ 'unpublish a page' if shared else 'unpublish a page you own' }} at any time.{% if sandbox %} Scripts in pages run in an isolated sandbox, so pages can’t use cookies or local storage.{% endif %}</p>
+      <p class="rule">Use one self-contained .html file with its CSS, scripts and images inline. Publishing, unpublishing and switching public/private always ask for the password. Published pages can’t be replaced: publish a new page to change one.{% if sandbox %} Scripts in pages run in an isolated sandbox, so pages can’t use cookies or local storage.{% endif %}</p>
     </div>
   </section>
+  {% endif %}
 
   <section class="panel" aria-labelledby="lh">
     <div class="phead">
       <div><h2 id="lh">Pages</h2><span class="sub num" id="stats">{{ rows|length }} page{{ '' if rows|length == 1 else 's' }} · {{ cats|length }} categor{{ 'y' if cats|length == 1 else 'ies' }}</span></div>
       <div class="tools"><div class="search">
         <svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="M20 20l-3.5-3.5"/></svg>
-        <input id="q" type="search" placeholder="Search pages" aria-label="Search pages by title, category or author">
+        <input id="q" type="search" placeholder="Search pages" aria-label="Search pages by title or category">
       </div></div>
     </div>
+<!--LOCKBAR-->
     {% with m = get_flashed_messages() %}{% if m %}<div class="flash">{% for x in m %}<p class="note ok" role="status">{{ x }}</p>{% endfor %}</div>{% endif %}{% endwith %}
     {% if cats %}
     <div class="chips" id="chips" role="group" aria-label="Filter by category">
@@ -1018,41 +1375,68 @@ PAGES_TMPL = _build(_TOP + r"""
       <thead><tr>
         <th scope="col" aria-sort="none"><button type="button" data-key="title">Title</button></th>
         <th scope="col" aria-sort="none"><button type="button" data-key="cat">Category</button></th>
-        <th scope="col" class="hide-md" aria-sort="none"><button type="button" data-key="by">Uploaded by</button></th>
         <th scope="col" class="hide-sm" aria-sort="descending"><button type="button" data-key="ts">Uploaded</button></th>
-        <th scope="col">Status</th>
-        {% if not shared %}<th scope="col" class="hide-md">Who can view</th>{% endif %}
+        {% if unlocked %}<th scope="col">Access</th><th scope="col">Status</th>{% endif %}
         <th scope="col" class="r"><span class="sr">Actions</span></th>
       </tr></thead>
       <tbody id="rows">
         {% for r in rows %}
-        <tr data-title="{{ r.title|lower }}" data-cat="{{ r.category }}" data-by="{{ r.uploaded_by }}" data-ts="{{ r.ts }}">
+        <tr data-title="{{ r.title|lower }}" data-label="{{ r.title }}" data-cat="{{ r.category }}" data-ts="{{ r.ts }}" data-id="{{ r.id }}" data-vis="{{ r.vis }}" data-pub="{{ 1 if r.published else 0 }}">
           <td><a class="fname" href="{{ url_for('view_page', pid=r.id) }}" target="_blank" rel="noopener">{{ r.title }}</a>
               <div class="stored" title="Stored filename">{{ r.stored_filename }} · {{ r.size }}</div></td>
           <td><span class="tag">{{ r.category }}</span></td>
-          <td class="hide-md">{{ r.uploaded_by }}</td>
           <td class="num hide-sm">{{ r.uploaded }}</td>
-          <td><span class="pill {{ 'ok' if r.published else 'off' }}">{{ 'Published' if r.published else 'Unpublished' }}</span></td>
-          {% if not shared %}<td class="hide-md"><div class="vw">{% if r.everyone %}<span class="sub">Everyone signed in</span>{% else %}{% for v in r.viewers %}<span class="tag">{{ v }}</span>{% endfor %}{% endif %}</div></td>{% endif %}
+          {% if unlocked %}<td>{% if r.vis == 'private' %}<button type="button" class="pill priv" data-act="vis" title="Make public" aria-label="{{ r.title }} is private. Make it public">{{ lock_svg|safe }}Private</button>
+              {% else %}<button type="button" class="pill pub" data-act="vis" title="Make private" aria-label="{{ r.title }} is public. Make it private">Public</button>{% endif %}</td>
+          <td><span class="pill {{ 'ok' if r.published else 'off' }}">{{ 'Published' if r.published else 'Unpublished' }}</span></td>{% endif %}
           <td class="r"><div class="act">
             <a class="dl" href="{{ url_for('view_page', pid=r.id) }}" target="_blank" rel="noopener" aria-label="Open {{ r.title }}">Open</a>
-            {% if r.can_manage %}
-            <form method="post" action="{{ url_for('set_status', pid=r.id) }}">
-              <input type="hidden" name="csrf" value="{{ csrf }}">
-              <input type="hidden" name="status" value="{{ 'unpublished' if r.published else 'published' }}">
-              <button class="mini" type="submit" aria-label="{{ 'Unpublish' if r.published else 'Publish' }} {{ r.title }}">{{ 'Unpublish' if r.published else 'Publish' }}</button>
-            </form>
-            {% endif %}
+            {% if unlocked %}<button type="button" class="mini{{ ' danger' if r.published }}" data-act="status" aria-label="{{ 'Unpublish' if r.published else 'Publish' }} {{ r.title }}">{{ 'Unpublish' if r.published else 'Publish' }}</button>{% endif %}
           </div></td>
         </tr>
         {% endfor %}
-        <tr class="empty" id="empty" {% if rows %}hidden{% endif %}><td colspan="{{ 6 if shared else 7 }}" id="emptytxt">No pages yet. Publish the first one with the form.</td></tr>
+        <tr class="empty" id="empty" {% if rows %}hidden{% endif %}><td colspan="{{ 6 if unlocked else 4 }}" id="emptytxt">{{ 'No pages yet. Publish the first one with the form.' if unlocked else 'No public pages yet.' }}</td></tr>
       </tbody>
     </table></div>
   </section>
 </main>
 
+{% if unlocked %}
+<dialog id="ad" aria-labelledby="adh">
+  <form id="adform" novalidate>
+    <h2 id="adh"></h2>
+    <p class="sub" id="adtxt"></p>
+    <label class="f" for="adpw">Password</label>
+    <input id="adpw" type="password" autocomplete="off" spellcheck="false">
+    <div id="aderr" class="note err" role="alert" hidden></div>
+    <div class="row">
+      <button type="button" class="btn ghost" id="adcancel">Cancel</button>
+      <button type="submit" class="btn" id="adgo"></button>
+    </div>
+  </form>
+</dialog>
+{% endif %}
+
 <script>
+/* collapsible side panel: hidden by default, remembered per browser */
+(function(){
+  var g=document.querySelector('main.grid'), rail=document.getElementById('railbtn'), close=document.getElementById('sideclose');
+  if(!g||!rail||!close)return;
+  var KEY='filenest-side-'+(location.pathname.indexOf('/pages')===0?'pages':'files');
+  function set(open,focus,save){
+    g.classList.toggle('collapsed',!open); rail.setAttribute('aria-expanded',open?'true':'false');
+    if(save){try{localStorage.setItem(KEY,open?'open':'closed')}catch(e){}}
+    if(focus){(open?close:rail).focus()}
+  }
+  var saved=null; try{saved=localStorage.getItem(KEY)}catch(e){}
+  if(g.dataset.force==='open'||saved==='open')set(true,false,false);
+  rail.onclick=function(){set(true,true,true)};
+  close.onclick=function(){set(false,true,true)};
+  document.addEventListener('dragenter',function(e){
+    var t=e.dataTransfer&&e.dataTransfer.types;
+    if(t&&Array.prototype.indexOf.call(t,'Files')!==-1&&g.classList.contains('collapsed')&&document.getElementById('zone'))set(true,false,false);
+  });
+})();
 (function(){
   var $=function(i){return document.getElementById(i)};
   var tbody=$('rows'), empty=$('empty'), q=$('q'), cat='', key='ts', dir=-1, MAXB={{ page_mb }}*1048576;
@@ -1060,7 +1444,7 @@ PAGES_TMPL = _build(_TOP + r"""
   function apply(){
     var term=q.value.trim().toLowerCase(), shown=0, all=rows();
     all.forEach(function(r){
-      var hay=r.dataset.title+' '+r.dataset.cat.toLowerCase()+' '+r.dataset.by;
+      var hay=r.dataset.title+' '+r.dataset.cat.toLowerCase();
       var ok=(!cat||r.dataset.cat===cat)&&(!term||hay.indexOf(term)!==-1);
       r.hidden=!ok; if(ok)shown++;
     });
@@ -1086,13 +1470,55 @@ PAGES_TMPL = _build(_TOP + r"""
       b.parentNode.setAttribute('aria-sort',dir===1?'ascending':'descending');
     };
   });
+  if(!{{ 'true' if unlocked else 'false' }}) return;   /* publish and edit controls exist only after unlock */
   var file=$('file'), esz=$('e-size'), pub=$('pub');
   file.addEventListener('change',function(){
     var f=file.files[0];
     if(f && f.size>MAXB){esz.textContent='That file is '+(f.size/1048576).toFixed(1)+' MB. The limit is {{ page_mb }} MB.';esz.hidden=false;file.value=''}
     else{esz.hidden=true}
   });
-  $('pf').addEventListener('submit',function(){pub.disabled=true;pub.textContent='Publishing\u2026'});
+  $('pf').addEventListener('submit',function(){pub.disabled=true;pub.textContent='Publishing…'});
+
+  /* publish / unpublish and public / private: every change asks for the password */
+  var ad=$('ad'), adpw=$('adpw'), aderr=$('aderr'), adgo=$('adgo'), act=null;
+  function adFail(t){aderr.textContent=t;aderr.hidden=false;adgo.disabled=false;adpw.select()}
+  function ask(o){
+    act=o; $('adh').textContent=o.title; $('adtxt').textContent=o.text;
+    adgo.textContent=o.btn; adgo.className='btn'+(o.danger?' danger':'');
+    aderr.hidden=true; adpw.value=''; adgo.disabled=false;
+    ad.showModal(); adpw.focus();
+  }
+  $('adcancel').onclick=function(){ad.close()};
+  $('adform').onsubmit=function(ev){
+    ev.preventDefault();
+    if(!adpw.value){adFail('Enter the password to continue.');return}
+    var fd=new FormData(); Object.keys(act.fields).forEach(function(k){fd.append(k,act.fields[k])});
+    fd.append('password',adpw.value);
+    aderr.hidden=true; adgo.disabled=true;
+    fetch(act.url,{method:'POST',body:fd,credentials:'same-origin'})
+      .then(function(r){return r.text().then(function(t){return {ok:r.ok,t:t}})})
+      .then(function(res){if(res.ok){location.reload()}else{adFail(res.t||'That didn’t work. Try again.')}})
+      .catch(function(){adFail('The connection dropped. Check your network and try again.')});
+  };
+  var STATUS_URL={{ url_for('set_status', pid=0)|tojson }}, VIS_URL={{ url_for('set_page_visibility', pid=0)|tojson }};
+  function forPage(u,id){return u.replace('/0/','/'+id+'/')}
+  tbody.addEventListener('click',function(e){
+    var b=e.target.closest('[data-act]'); if(!b)return;
+    var d=b.closest('tr').dataset, name=d.label;
+    if(b.dataset.act==='status'){
+      var pub=d.pub==='1';
+      ask({title:(pub?'Unpublish':'Publish')+' “'+name+'”?', btn:pub?'Unpublish':'Publish', danger:pub,
+           url:forPage(STATUS_URL,d.id), fields:{status:pub?'unpublished':'published'},
+           text:pub?'Nobody will be able to open it until it is published again. It stays listed for people who unlock with the password.'
+                   :'It will open again for '+(d.vis==='public'?'everyone.':'people who unlock with the password.')});
+    }else{
+      var toPub=d.vis==='private';
+      ask({title:'Make “'+name+'” '+(toPub?'public':'private')+'?', btn:toPub?'Make public':'Make private',
+           url:forPage(VIS_URL,d.id), fields:{visibility:toPub?'public':'private'},
+           text:toPub?'Anyone who can reach this site will be able to open it without a password.'
+                     :'Only people who unlock with the password will be able to see or open it.'});
+    }
+  });
 })();
 </script>
 </body></html>
@@ -1100,52 +1526,12 @@ PAGES_TMPL = _build(_TOP + r"""
 
 
 # ===================================================================
-# Hosted HTML pages: accounts, publishing, per-user / per-group viewing
+# Hosted HTML pages: each one public or private, like files
 # ===================================================================
-DUMMY_HASH = generate_password_hash("not-a-real-password")   # equalises login timing
 SANDBOX_CSP = ("sandbox allow-scripts allow-popups allow-popups-to-escape-sandbox "
                "allow-downloads allow-modals")
 HTML_HINT = re.compile(rb"<\s*(!doctype|html|head|body|div|p|h[1-6]|table|svg|section|main|article|script|style)\b", re.I)
 CATEGORY_RE = re.compile(r"[\w &/.\-]{1,60}")
-
-_users_cache = {"mtime": None, "data": {}}
-
-
-def load_users():
-    """Accounts from users.json (made by manage_users.py). Re-read when the file changes."""
-    try:
-        mtime = USERS_FILE.stat().st_mtime
-    except OSError:
-        return {}
-    if _users_cache["mtime"] != mtime:
-        try:
-            raw = json.loads(USERS_FILE.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            return {}
-        data = {}
-        for name, u in (raw.get("users") or {}).items():
-            data[name] = {"name": name, "hash": u.get("password_hash", ""),
-                          "groups": sorted({str(g).lower() for g in u.get("groups", [])}),
-                          "role": "admin" if u.get("role") == "admin" else "user"}
-        _users_cache.update(mtime=mtime, data=data)
-    return _users_cache["data"]
-
-
-NAME_OK = re.compile(r"[\w .\-]{2,32}")
-
-
-def current_user():
-    name = session.get("user")
-    if not name:
-        return None
-    if SHARED_MODE:
-        if session.get("mode") != "shared":
-            return None
-        # one shared password: everyone signed in has the same rights, the name is only a label
-        return {"name": name, "groups": [], "role": "admin", "shared": True}
-    if session.get("mode") != "accounts":
-        return None
-    return load_users().get(name)
 
 
 def csrf_token():
@@ -1162,16 +1548,6 @@ def csrf_ok():
 
 def safe_next(url):
     return url if url.startswith("/") and not url.startswith("//") and "\\" not in url else ""
-
-
-def login_required(fn):
-    @wraps(fn)
-    def wrapper(*args, **kwargs):
-        if not current_user():
-            nxt = request.full_path.rstrip("?") if request.method == "GET" else url_for("pages")
-            return redirect(url_for("login", next=nxt))
-        return fn(*args, **kwargs)
-    return wrapper
 
 
 # ---------- metadata database (SQLite: safe with several gunicorn workers) ----------
@@ -1202,54 +1578,35 @@ def init_pages():
         uploaded_by TEXT NOT NULL,
         uploaded_at REAL NOT NULL,
         status TEXT NOT NULL DEFAULT 'published',
-        viewer_users TEXT NOT NULL DEFAULT '[]',
-        viewer_groups TEXT NOT NULL DEFAULT '[]',
+        viewer_users TEXT NOT NULL DEFAULT '[]',     -- no longer used (kept for older databases)
+        viewer_groups TEXT NOT NULL DEFAULT '[]',    -- no longer used (kept for older databases)
         size INTEGER NOT NULL DEFAULT 0)""")
+    cols = {r["name"] for r in query("PRAGMA table_info(pages)")}
+    if "visibility" not in cols:
+        # pages published before this version start private, so nothing becomes public by surprise
+        execute(f"ALTER TABLE pages ADD COLUMN visibility TEXT NOT NULL DEFAULT '{DEFAULT_VISIBILITY}'")
 
 
-def can_manage(row, user):
-    return bool(user) and (user["role"] == "admin" or row["uploaded_by"] == user["name"])
+def can_view(row):
+    """Public + published pages are open to everyone. Anything else needs the password."""
+    if files_unlocked():
+        return True
+    return row["status"] == "published" and row["visibility"] == "public"
 
 
-def can_view(row, user):
-    if not user:
-        return False
-    if can_manage(row, user):
-        return True            # owner and admins can always open it (even when unpublished)
-    if row["status"] != "published":
-        return False
-    vu, vg = json.loads(row["viewer_users"]), json.loads(row["viewer_groups"])
-    if not vu and not vg:
-        return True            # no restriction: every signed-in user
-    return user["name"] in vu or bool(set(vg) & set(user["groups"]))
-
-
-def page_view(row, user):
-    vu, vg = json.loads(row["viewer_users"]), json.loads(row["viewer_groups"])
+def page_view(row):
     return {"id": row["id"], "title": row["title"], "category": row["category"],
-            "stored_filename": row["stored_filename"], "uploaded_by": row["uploaded_by"],
-            "ts": row["uploaded_at"],
+            "stored_filename": row["stored_filename"], "ts": row["uploaded_at"],
             "uploaded": time.strftime("%Y-%m-%d %H:%M", time.localtime(row["uploaded_at"])),
             "published": row["status"] == "published", "size": human(row["size"] or 0),
-            "everyone": not (vu or vg), "viewers": vu + ["@" + g for g in vg],
-            "can_manage": can_manage(row, user)}
+            "vis": row["visibility"]}
 
 
-def parse_viewers(text, users):
-    """'alice, @ops' -> (['alice'], ['ops'], None). Empty or 'everyone' = no restriction."""
-    toks = [t for t in re.split(r"[,;\s]+", (text or "").strip().lower()) if t]
-    groups = {g for u in users.values() for g in u["groups"]}
-    vu, vg, bad = [], [], []
-    for t in toks:
-        if t in ("everyone", "*", "all"):
-            return [], [], None
-        if t.startswith("@"):
-            (vg if t[1:] in groups else bad).append(t[1:] if t[1:] in groups else t)
-        else:
-            (vu if t in users else bad).append(t)
-    if bad:
-        return [], [], "Unknown user or group: " + ", ".join(dict.fromkeys(bad)) + "."
-    return list(dict.fromkeys(vu)), list(dict.fromkeys(vg)), None
+def get_page(pid):
+    rows = query("SELECT * FROM pages WHERE id = ?", (pid,))
+    if not rows:
+        abort(404)
+    return rows[0]
 
 
 def check_html(data):
@@ -1259,117 +1616,63 @@ def check_html(data):
     if len(data) > PAGE_MAX_MB * 1024 * 1024:
         return f"The file is larger than {PAGE_MAX_MB} MB."
     if b"\x00" in data:
-        return "That doesn\u2019t look like an HTML file."
+        return "That doesn’t look like an HTML file."
     try:
         data.decode("utf-8")
     except UnicodeDecodeError:
         return "The file must be saved as UTF-8."
     if not HTML_HINT.search(data[:65536]):
-        return "That doesn\u2019t look like an HTML page (no HTML tags found)."
+        return "That doesn’t look like an HTML page (no HTML tags found)."
     return None
 
 
 def render_pages(errors=None, form=None, status=200):
-    user = current_user()
-    rows = [page_view(r, user) for r in query("SELECT * FROM pages ORDER BY uploaded_at DESC")
-            if can_view(r, user)]
+    rows = [page_view(r) for r in query("SELECT * FROM pages ORDER BY uploaded_at DESC") if can_view(r)]
     counts = {}
     for r in rows:
         counts[r["category"]] = counts.get(r["category"], 0) + 1
     cats = sorted(counts.items(), key=lambda kv: kv[0].lower())
-    groups = sorted({g for u in load_users().values() for g in u["groups"]})
     return render_template_string(
-        PAGES_TMPL, rows=rows, cats=cats, errors=errors or {}, groups=groups,
-        form=form or {"title": "", "category": "", "viewers": ""},
-        user=user, csrf=csrf_token(), sandbox=PAGE_SANDBOX, page_mb=PAGE_MAX_MB, need_pw=PROTECT_UPLOAD,
-        shared=SHARED_MODE,
-        title=APP_TITLE, max_w=PAGE_MAX_WIDTH, pages_on=True, nav="pages",
-        ptitle=f"Pages \u00b7 {APP_TITLE}",
-        badge="Pages are never deleted or replaced",
-        badge_hint="Pages can be published and unpublished. They can\u2019t be deleted or replaced."), status
+        PAGES_TMPL, rows=rows, cats=cats, errors=errors or {}, what="pages",
+        form=form or {"title": "", "category": "", "visibility": DEFAULT_VISIBILITY},
+        sandbox=PAGE_SANDBOX, page_mb=PAGE_MAX_MB, nav="pages",
+        ptitle=f"Pages · {APP_TITLE}"), status
 
 
 def msg_page(heading, text, status):
-    user = current_user()
     return render_template_string(
-        MSG_TMPL, heading=heading, text=text, user=user, csrf=csrf_token(),
-        title=APP_TITLE, max_w=PAGE_MAX_WIDTH, pages_on=True, nav="pages",
-        ptitle=f"{heading} \u00b7 {APP_TITLE}",
-        badge="Pages are never deleted or replaced"), status
+        MSG_TMPL, heading=heading, text=text, nav="pages",
+        ptitle=f"{heading} · {APP_TITLE}"), status
 
 
-# ---------- routes: sign in / out ----------
-@app.route("/login", methods=["GET", "POST"])
+# ---------- old sign-in links: there is no username any more, only the password ----------
+@app.get("/login")
 def login():
-    users = load_users()
-    nxt = safe_next(request.values.get("next", ""))
-    error, username, status = "", "", 200
-    if request.method == "POST":
-        ip = "login:" + client_ip()
-        if SHARED_MODE:
-            username = " ".join((request.form.get("username") or "").split())
-        else:
-            username = (request.form.get("username") or "").strip().lower()
-        if not csrf_ok():
-            error, status = "Your session expired. Please try again.", 400
-        elif locked_out(ip):
-            error, status = "Too many failed sign-ins. Try again in a few minutes.", 429
-        elif SHARED_MODE and not NAME_OK.fullmatch(username):
-            error, status = "Enter your name (2 to 32 letters, numbers, spaces, dots, dashes or underscores).", 400
-        else:
-            pw = request.form.get("password", "")
-            if SHARED_MODE:
-                good = password_ok(pw)
-                who = username
-            else:
-                u = users.get(username)
-                good = check_password_hash(u["hash"] if u else DUMMY_HASH, pw) and bool(u)
-                who = username
-            if good:
-                _fails.pop(ip, None)
-                session.clear()
-                session.permanent = True
-                session["user"] = who
-                session["mode"] = "shared" if SHARED_MODE else "accounts"
-                return redirect(nxt or url_for("pages"))
-            _fails.setdefault(ip, []).append(time.time())
-            error, status = ("Wrong password." if SHARED_MODE else "Wrong username or password."), 401
-    return render_template_string(
-        LOGIN_TMPL, configured=SHARED_MODE or bool(users), shared=SHARED_MODE, error=error,
-        username=username, nxt=nxt, user=None, csrf=csrf_token(), title=APP_TITLE,
-        max_w=PAGE_MAX_WIDTH, pages_on=True, nav="pages", ptitle=f"Sign in \u00b7 {APP_TITLE}",
-        badge="Pages need a sign-in"), status
+    return redirect(url_for("unlock", next=safe_next(request.args.get("next", "")) or url_for("pages")))
 
 
 @app.post("/logout")
 def logout():
-    if csrf_ok():
-        session.clear()
-    return redirect(url_for("login"))
+    return lock()
 
 
 # ---------- routes: pages ----------
 @app.get("/pages")
-@login_required
 def pages():
     return render_pages()
 
 
 @app.post("/pages/publish")
-@login_required
 def publish():
-    user = current_user()
-    if not csrf_ok():
-        body, _ = render_pages(errors={"form": "Your session expired. Reload the page and try again."})
-        return body, 400
     title = " ".join((request.form.get("title") or "").split())
     category = " ".join((request.form.get("category") or "").split())
-    viewers = (request.form.get("viewers") or "").strip()
+    vis = (request.form.get("visibility") or "").strip().lower()
+    vis = vis if vis in ("public", "private") else DEFAULT_VISIBILITY
+    form = {"title": title, "category": category, "visibility": vis}
     f = request.files.get("file")
-    bad = check_password()      # same shared upload password as the file area (when PROTECT_UPLOAD is on)
+    bad = check_password()      # the same password as uploads in the file area
     if bad:
-        body, _ = render_pages(errors={"password": bad[0]},
-                               form={"title": title, "category": category, "viewers": viewers})
+        body, _ = render_pages(errors={"password": bad[0]}, form=form)
         return body, bad[1]
     errors = {}
     if not title:
@@ -1380,9 +1683,6 @@ def publish():
         errors["category"] = "Enter a category."
     elif not CATEGORY_RE.fullmatch(category):
         errors["category"] = "Use up to 60 letters, numbers, spaces, - _ . / or &."
-    vu, vg, verr = ([], [], None) if SHARED_MODE else parse_viewers(viewers, load_users())
-    if verr:
-        errors["viewers"] = verr
     data = b""
     if not f or not f.filename:
         errors["file"] = "Choose an HTML file."
@@ -1394,7 +1694,7 @@ def publish():
         if errors_file:
             errors["file"] = errors_file
     if errors:
-        body, _ = render_pages(errors=errors, form={"title": title, "category": category, "viewers": viewers})
+        body, _ = render_pages(errors=errors, form=form)
         return body, 400
     slug = re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")[:40] or "page"
     stored = f"{secrets.token_hex(6)}-{slug}.html"
@@ -1403,48 +1703,53 @@ def publish():
         fh.write(data)
     os.chmod(path, 0o640)
     execute("""INSERT INTO pages (title, category, stored_filename, original_filename, uploaded_by,
-               uploaded_at, status, viewer_users, viewer_groups, size)
-               VALUES (?, ?, ?, ?, ?, ?, 'published', ?, ?, ?)""",
-            (title, category, stored, secure_filename(f.filename), user["name"], time.time(),
-             json.dumps(vu), json.dumps(vg), len(data)))
-    flash(f"Published \u201c{title}\u201d in {category}.")
+               uploaded_at, status, visibility, size)
+               VALUES (?, ?, ?, ?, ?, ?, 'published', ?, ?)""",
+            (title, category, stored, secure_filename(f.filename), AUTH_USER, time.time(), vis, len(data)))
+    flash(f"Published “{title}” in {category} as {vis}.")
     return redirect(url_for("pages"))
 
 
 @app.post("/pages/<int:pid>/status")
-@login_required
 def set_status(pid):
-    user = current_user()
-    if not csrf_ok():
-        return msg_page("Session expired", "Reload the page and try again.", 400)
-    rows = query("SELECT * FROM pages WHERE id = ?", (pid,))
-    if not rows:
-        abort(404)
-    row = rows[0]
-    if not can_manage(row, user):
-        return msg_page("Not allowed", "Only the person who published a page, or an admin, can change its status.", 403)
+    bad = check_password()
+    if bad:
+        return bad
+    row = get_page(pid)
     new = "published" if request.form.get("status") == "published" else "unpublished"
     execute("UPDATE pages SET status = ? WHERE id = ?", (new, pid))
-    flash(f"\u201c{row['title']}\u201d is now {new}.")
-    return redirect(url_for("pages"))
+    flash(f"“{row['title']}” is now {new}.")
+    return "", 204
+
+
+@app.post("/pages/<int:pid>/visibility")
+def set_page_visibility(pid):
+    bad = check_password()
+    if bad:
+        return bad
+    row = get_page(pid)
+    vis = (request.form.get("visibility") or "").strip().lower()
+    if vis not in ("public", "private"):
+        return "Choose public or private.", 400
+    execute("UPDATE pages SET visibility = ? WHERE id = ?", (vis, pid))
+    flash(f"“{row['title']}” is now {vis}.")
+    return "", 204
 
 
 @app.get("/p/<int:pid>")
 def view_page(pid):
-    user = current_user()
-    if not user:
-        return redirect(url_for("login", next=request.path))
     rows = query("SELECT * FROM pages WHERE id = ?", (pid,))
     if not rows:
-        return msg_page("Page not found", "This page doesn\u2019t exist.", 404)
+        return msg_page("Page not found", "This page doesn’t exist.", 404)
     row = rows[0]
-    if not can_view(row, user):
-        return msg_page("No access", "You don\u2019t have permission to view this page, or it isn\u2019t published.", 403)
+    if not can_view(row):
+        # private or unpublished: ask for the password (same answer either way, nothing leaks)
+        return redirect(url_for("unlock", next=request.path))
     path = os.path.join(PAGE_FILES_DIR, row["stored_filename"])
     if not os.path.isfile(path):
         return msg_page("Page not found", "The file for this page is missing on the server.", 404)
     resp = send_from_directory(PAGE_FILES_DIR, row["stored_filename"], mimetype="text/html")
-    resp.headers["Cache-Control"] = "private, no-store"
+    resp.headers["Cache-Control"] = "no-cache" if row["visibility"] == "public" else "private, no-store"
     resp.headers["Referrer-Policy"] = "no-referrer"
     if PAGE_SANDBOX:
         # Opaque origin: scripts in the page can't use this site's cookies or call its endpoints.
@@ -1459,14 +1764,17 @@ def security_headers(resp):
     return resp
 
 
+try:
+    init_files_db()
+except (OSError, sqlite3.Error) as e:
+    sys.exit(f"[FATAL] Cannot prepare the public/private settings database {FILES_DB}: {e}")
+
 if PAGES_ENABLED:
     try:
         init_pages()
     except OSError as e:
         sys.exit(f"[FATAL] Cannot prepare the pages folder {PAGES_DIR}: {e}")
-    print(f"[fileshare] pages enabled | folder: {PAGES_DIR} | sign-in: "
-          + ("shared password" if SHARED_MODE else f"accounts ({len(load_users())} in {USERS_FILE})"),
-          file=sys.stderr)
+    print(f"[fileshare] pages enabled | folder: {PAGES_DIR}", file=sys.stderr)
 
 
 @app.errorhandler(413)
